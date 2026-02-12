@@ -104,6 +104,24 @@ impl PlaceMode {
 }
 
 // ============================================================
+// UI BUTTONS
+// ============================================================
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BtnAction {
+    SetPlanet, SetHeavy, SetStar, SetAsteroids, SetSolarSystem,
+    ToggleTrails, ToggleOrbits, ToggleGrid, TogglePause,
+    Recenter, Clear, Explode, NewSystem,
+    TimeSlower, TimeFaster,
+}
+
+struct BtnRect {
+    x: f32, y: f32, w: f32, h: f32,
+    action: BtnAction,
+    label: &'static str,
+    active: bool,
+}
+
+// ============================================================
 // CAMERA
 // ============================================================
 struct Camera {
@@ -563,6 +581,84 @@ fn draw_grid(cam: &Camera, sw: f64, sh: f64) {
 }
 
 // ============================================================
+// UI BUTTON HELPERS
+// ============================================================
+fn layout_buttons(
+    sw: f32, sh: f32, place_mode: PlaceMode,
+    show_trails: bool, show_orbits: bool, show_grid: bool, paused: bool,
+) -> Vec<BtnRect> {
+    let btn_h = 36.0f32;
+    let gap = 5.0f32;
+    let margin = 10.0f32;
+    let pad_x = 12.0f32;
+    let font_size = 15u16;
+
+    let rows: [&[(&str, BtnAction, bool)]; 3] = [
+        &[
+            ("PLANET", BtnAction::SetPlanet, place_mode == PlaceMode::Planet),
+            ("GIANT", BtnAction::SetHeavy, place_mode == PlaceMode::Heavy),
+            ("STAR", BtnAction::SetStar, place_mode == PlaceMode::Star),
+            ("ASTEROIDS", BtnAction::SetAsteroids, place_mode == PlaceMode::Asteroids),
+            ("SOLAR SYS", BtnAction::SetSolarSystem, place_mode == PlaceMode::SolarSystem),
+        ],
+        &[
+            ("TRAILS", BtnAction::ToggleTrails, show_trails),
+            ("ORBITS", BtnAction::ToggleOrbits, show_orbits),
+            ("GRID", BtnAction::ToggleGrid, show_grid),
+            ("PAUSE", BtnAction::TogglePause, paused),
+            ("SLOWER", BtnAction::TimeSlower, false),
+            ("FASTER", BtnAction::TimeFaster, false),
+        ],
+        &[
+            ("CENTER", BtnAction::Recenter, false),
+            ("CLEAR", BtnAction::Clear, false),
+            ("EXPLODE", BtnAction::Explode, false),
+            ("NEW SYS", BtnAction::NewSystem, false),
+        ],
+    ];
+
+    let mut buttons = Vec::new();
+    for (row_idx, items) in rows.iter().enumerate() {
+        let y = sh - margin - ((rows.len() - row_idx) as f32) * (btn_h + gap);
+        let mut x = margin;
+        for &(label, action, active) in *items {
+            let dims = measure_text(label, None, font_size, 1.0);
+            let w = dims.width + pad_x * 2.0;
+            if x + w > sw - margin && x > margin + 1.0 {
+                x = margin;
+            }
+            buttons.push(BtnRect { x, y, w, h: btn_h, action, label, active });
+            x += w + gap;
+        }
+    }
+    buttons
+}
+
+fn draw_buttons(buttons: &[BtnRect]) {
+    let font_size = 15.0f32;
+    for btn in buttons {
+        let bg_alpha = if btn.active { 0.22 } else { 0.08 };
+        draw_rectangle(btn.x, btn.y, btn.w, btn.h, Color::new(1.0, 1.0, 1.0, bg_alpha));
+        draw_rectangle_lines(btn.x, btn.y, btn.w, btn.h, 1.0, Color::new(1.0, 1.0, 1.0, 0.15));
+
+        let dims = measure_text(btn.label, None, font_size as u16, 1.0);
+        let tx = btn.x + (btn.w - dims.width) / 2.0;
+        let ty = btn.y + (btn.h + dims.height) / 2.0 - 2.0;
+        let text_alpha = if btn.active { 1.0 } else { 0.85 };
+        draw_text(btn.label, tx, ty, font_size, Color::new(1.0, 1.0, 1.0, text_alpha));
+    }
+}
+
+fn check_button_hit(buttons: &[BtnRect], mx: f32, my: f32) -> Option<BtnAction> {
+    for btn in buttons {
+        if mx >= btn.x && mx <= btn.x + btn.w && my >= btn.y && my <= btn.y + btn.h {
+            return Some(btn.action);
+        }
+    }
+    None
+}
+
+// ============================================================
 // MAIN
 // ============================================================
 fn window_conf() -> Conf {
@@ -629,6 +725,11 @@ async fn main() {
 
         flash.update(dt_capped);
 
+        let buttons = layout_buttons(
+            screen_width(), screen_height(), place_mode,
+            show_trails, show_orbits, show_grid, paused,
+        );
+
         // ---- INPUT ----
         if is_key_pressed(KeyCode::Key1) { place_mode = PlaceMode::Planet; flash.show("PLANET"); }
         if is_key_pressed(KeyCode::Key2) { place_mode = PlaceMode::Heavy; flash.show("GIANT"); }
@@ -693,11 +794,51 @@ async fn main() {
             cam.zoom_target = (cam.zoom_target / 1.3).max(0.15);
         }
 
-        // Mouse drag to place/launch
+        // Mouse / touch: check buttons first, then drag-to-place
         let (mx, my) = mouse_position();
         if is_mouse_button_pressed(MouseButton::Left) {
-            dragging = true;
-            drag_start = cam.screen_to_world(mx as f64, my as f64, sw, sh);
+            if let Some(action) = check_button_hit(&buttons, mx, my) {
+                match action {
+                    BtnAction::SetPlanet => { place_mode = PlaceMode::Planet; flash.show("PLANET"); }
+                    BtnAction::SetHeavy => { place_mode = PlaceMode::Heavy; flash.show("GIANT"); }
+                    BtnAction::SetStar => { place_mode = PlaceMode::Star; flash.show("STAR"); }
+                    BtnAction::SetAsteroids => { place_mode = PlaceMode::Asteroids; flash.show("ASTEROIDS"); }
+                    BtnAction::SetSolarSystem => { place_mode = PlaceMode::SolarSystem; flash.show("SOLAR SYSTEM"); }
+                    BtnAction::ToggleTrails => { show_trails = !show_trails; flash.show(if show_trails { "TRAILS ON" } else { "TRAILS OFF" }); }
+                    BtnAction::ToggleOrbits => { show_orbits = !show_orbits; flash.show(if show_orbits { "ORBITS ON" } else { "ORBITS OFF" }); }
+                    BtnAction::ToggleGrid => { show_grid = !show_grid; flash.show(if show_grid { "GRID ON" } else { "GRID OFF" }); }
+                    BtnAction::TogglePause => { paused = !paused; flash.show(if paused { "PAUSED" } else { "RUNNING" }); }
+                    BtnAction::Recenter => { cam.recenter(); flash.show("CENTERED"); }
+                    BtnAction::Clear => { bodies.clear(); flash.show("CLEARED"); }
+                    BtnAction::Explode => {
+                        let (cx, cy) = center_of_mass(&bodies);
+                        for b in &mut bodies {
+                            let bx = b.x - cx;
+                            let by = b.y - cy;
+                            let d = (bx * bx + by * by).sqrt().max(1.0);
+                            b.vx += bx / d * 10.0;
+                            b.vy += by / d * 10.0;
+                        }
+                        flash.show("BOOM");
+                    }
+                    BtnAction::NewSystem => {
+                        let (cx, cy) = if bodies.is_empty() { (cam.x, cam.y) } else { center_of_mass(&bodies) };
+                        spawn_system(&mut bodies, cx, cy, 0.0, 0.0);
+                        flash.show("NEW SYSTEM");
+                    }
+                    BtnAction::TimeSlower => {
+                        time_scale = (time_scale / 1.5).max(0.1);
+                        flash.show(&format!("{:.1}X", time_scale));
+                    }
+                    BtnAction::TimeFaster => {
+                        time_scale = (time_scale * 1.5).min(10.0);
+                        flash.show(&format!("{:.1}X", time_scale));
+                    }
+                }
+            } else {
+                dragging = true;
+                drag_start = cam.screen_to_world(mx as f64, my as f64, sw, sh);
+            }
         }
         if is_mouse_button_released(MouseButton::Left) && dragging {
             dragging = false;
@@ -763,26 +904,16 @@ async fn main() {
 
         // ---- HUD ----
         let total_mass: f64 = bodies.iter().map(|b| b.mass).sum();
-        let hud_color = Color::new(0.75, 0.75, 0.8, 1.0);
-        draw_text("VOID", 16.0, 28.0, 24.0, Color::new(0.85, 0.85, 0.9, 1.0));
-        draw_text("orbital simulator", 16.0, 42.0, 12.0, Color::new(0.55, 0.55, 0.6, 0.9));
+        draw_text("VOID", 16.0, 38.0, 32.0, Color::new(1.0, 1.0, 1.0, 1.0));
+        draw_text("orbital simulator", 16.0, 58.0, 16.0, Color::new(0.8, 0.8, 0.85, 1.0));
 
         let stats = format!(
-            "{} bodies | {} mass | {:.1}x | {}% | {} | {} fps",
-            bodies.len(), total_mass as i64, time_scale, (cam.zoom * 100.0) as i32, place_mode.name(), fps_display
+            "{} bodies  |  {} mass  |  {:.1}x  |  {}%  |  {} fps",
+            bodies.len(), total_mass as i64, time_scale, (cam.zoom * 100.0) as i32, fps_display
         );
-        draw_text(&stats, 16.0, 62.0, 13.0, hud_color);
+        draw_text(&stats, 16.0, 82.0, 18.0, Color::new(0.95, 0.95, 1.0, 1.0));
 
-        let help_y = screen_height() - 16.0;
-        let help_color = Color::new(0.55, 0.55, 0.6, 0.85);
-        draw_text(
-            "click: place | drag: launch | 1-4: body type | 5: solar system | T: trails | O: orbits | G: grid | F: pause",
-            16.0, help_y - 14.0, 11.0, help_color,
-        );
-        draw_text(
-            "pinch: zoom | scroll: pan | +/-: zoom | [ ]: time | H: recenter | C: clear | X: explode | space: new system",
-            16.0, help_y, 11.0, help_color,
-        );
+        draw_buttons(&buttons);
 
         flash.draw();
         next_frame().await;
