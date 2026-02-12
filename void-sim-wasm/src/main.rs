@@ -8,7 +8,7 @@ const G: f64 = 0.5;
 const SOFTENING_SQ: f64 = 100.0;
 const TRAIL_MAX: usize = 200;
 const ORBIT_PREDICTION_STEPS: usize = 200;
-const MAX_BODIES: usize = 500;
+const MAX_BODIES: usize = 300;
 
 // ============================================================
 // BODY
@@ -406,90 +406,62 @@ fn compute_collision_outcome(a: &Body, b: &Body, body_count: usize) -> Vec<Body>
 
     let collision_r = a.radius + b.radius;
 
-    // ---- Simple merge: low energy, tiny bodies, or too many bodies ----
-    if body_count > MAX_BODIES || total_mass < 6.0 || eta < 0.3 {
+    // ---- MERGE for most collisions ----
+    // Only fragment for very energetic impacts (η > 1.5).
+    // Stars always absorb. Tiny bodies always merge. Cap body count at 300.
+    if body_count > MAX_BODIES || total_mass < 6.0 || eta < 1.5
+        || a.body_type == BodyType::Star || b.body_type == BodyType::Star
+    {
         return vec![make_body(total_mass, com_x, com_y, com_vx, com_vy)];
     }
 
-    // ---- Determine fragment count and mass distribution ----
-    let is_star = a.body_type == BodyType::Star || b.body_type == BodyType::Star;
-    let star_absorbs = is_star
-        && (eta < 2.0 || a.mass.min(b.mass) < a.mass.max(b.mass) * 0.3);
+    // ---- Fragmentation: only for high-energy non-star collisions ----
+    //  η 1.5–3.0: 1 large + 2-3 debris  (max 4)
+    //  η ≥ 3.0:   1 large + 3-5 debris  (max 6)
 
-    let largest_frac = if star_absorbs {
-        0.92 - (eta * 0.04).min(0.15)
-    } else if eta < 1.0 {
-        0.70 - 0.15 * eta
-    } else if eta < 3.0 {
-        0.55 - 0.125 * (eta - 1.0)
+    let largest_frac = if eta < 3.0 {
+        0.65 - 0.05 * (eta - 1.5)   // 65% → 57%
     } else {
-        (0.20 - 0.02 * (eta - 3.0)).max(0.08)
+        (0.45 - 0.03 * (eta - 3.0)).max(0.30) // 45% → min 30%
     };
 
-    let n_medium = if star_absorbs { 0 }
-        else { ((1.0 + eta * 0.8).min(3.0)) as usize };
-    let n_small = if star_absorbs {
-        ((2.0 + eta).min(5.0)) as usize
+    let n_debris = if eta < 3.0 {
+        ((1.0 + eta * 0.7).min(3.0)) as usize
     } else {
-        ((3.0 + eta * 2.0).min(10.0)) as usize
+        ((2.0 + eta * 0.5).min(5.0)) as usize
     };
 
-    // ---- Build mass array, then NORMALIZE to exact total_mass ----
-    let total_frags = 1 + n_medium + n_small;
+    // ---- Build mass array, NORMALIZE to exact total_mass ----
+    let total_frags = 1 + n_debris;
     let mut masses = Vec::with_capacity(total_frags);
-
-    // Largest fragment
     masses.push(largest_frac);
-
-    // Medium chunks
-    for _ in 0..n_medium {
-        masses.push(rand::gen_range(0.06, 0.14));
+    for _ in 0..n_debris {
+        masses.push(rand::gen_range(0.02, 0.10));
     }
-
-    // Small debris
-    for _ in 0..n_small {
-        masses.push(rand::gen_range(0.005, 0.03));
-    }
-
-    // Normalize: exact mass conservation
     let raw_sum: f64 = masses.iter().sum();
     for m in masses.iter_mut() {
         *m = (*m / raw_sum) * total_mass;
     }
 
-    // ---- Place fragments spatially around collision center ----
+    // ---- Place fragments far apart around collision center ----
     let mut result: Vec<Body> = Vec::with_capacity(total_frags);
     for (i, &m) in masses.iter().enumerate() {
         let angle = (i as f64 / total_frags as f64) * std::f64::consts::TAU
-            + rand::gen_range(-0.3, 0.3);
-        let dist = if i == 0 {
-            collision_r * 0.2
-        } else if i <= n_medium {
-            collision_r * rand::gen_range(1.5, 3.0)
-        } else {
-            collision_r * rand::gen_range(2.0, 4.5)
-        };
+            + rand::gen_range(-0.2, 0.2);
+        let dist = if i == 0 { collision_r * 0.3 }
+            else { collision_r * rand::gen_range(3.0, 6.0) };
         result.push(make_body(
             m,
             com_x + angle.cos() * dist,
             com_y + angle.sin() * dist,
-            0.0, 0.0, // velocities assigned below
+            0.0, 0.0,
         ));
     }
 
-    // ---- Assign velocities with EXACT momentum + energy conservation ----
-    //
-    // Work in the COM frame where total momentum = 0 by construction.
-    //   1. Give each fragment a random direction, speed ∝ 1/√mass (lighter = faster)
-    //   2. Subtract mass-weighted mean to enforce Σ(m_i * v_i) = 0
-    //   3. Scale all speeds uniformly so Σ(½ m_i |v_i|²) = target KE
-    //   4. Boost all by (com_vx, com_vy) → lab frame
-    //
-    // This guarantees:
-    //   Total momentum = M * com_v  (exact)
-    //   Total KE ≤ original KE      (exact, with 5% dissipation for inelasticity)
-
-    let dissipation = 0.95; // 5% lost to "heat" — prevents energy build-up
+    // ---- Assign velocities: COM-frame construction ----
+    // Heavy dissipation: keep only 40% of COM-frame KE.
+    // This prevents gravity from re-accelerating fragments into a cascade.
+    let dissipation = 0.40;
     let target_ke = ke_com * dissipation;
 
     // Step 1: random directions, speed ∝ 1/√m
@@ -526,9 +498,10 @@ fn compute_collision_outcome(a: &Body, b: &Body, body_count: usize) -> Vec<Body>
         b.vy = com_vy + v.1;
     }
 
-    // Cooldown: prevent fragments from immediately re-colliding
+    // Long cooldown: fragments need time to separate before they can
+    // re-collide. 60 sim-time units ≈ 1 second of wall time at 1x speed.
     for b in result.iter_mut() {
-        b.cooldown = 0.5;
+        b.cooldown = 60.0;
     }
 
     result
@@ -1209,52 +1182,37 @@ mod tests {
             "Extreme momentum Y: got {opy}, expected {ipy}");
     }
 
-    // ---- Star absorption ----
+    // ---- Star collisions always merge ----
 
     #[test]
-    fn star_absorption_conserves_mass() {
+    fn star_always_merges() {
         let star = Body::new(0.0, 0.0, 0.0, 0.0, 800.0, 20.0, BodyType::Star);
-        let planet = Body::new(15.0, 0.0, -5.0, 2.0, 15.0, 4.0, BodyType::Planet);
+        let planet = Body::new(15.0, 0.0, -50.0, 2.0, 100.0, 8.0, BodyType::Heavy);
+        let result = compute_collision_outcome(&star, &planet, 10);
+        assert_eq!(result.len(), 1, "Star collision should always merge");
+    }
+
+    #[test]
+    fn star_merge_conserves_mass() {
+        let star = Body::new(0.0, 0.0, 1.0, -0.5, 800.0, 20.0, BodyType::Star);
+        let planet = Body::new(15.0, 0.0, -10.0, 3.0, 15.0, 4.0, BodyType::Planet);
         let input = star.mass + planet.mass;
         let result = compute_collision_outcome(&star, &planet, 10);
         let output = mass_of(&result);
         assert!((output - input).abs() < 1e-10,
-            "Star absorption mass: got {output}, expected {input}");
-    }
-
-    #[test]
-    fn star_absorption_ke_does_not_increase() {
-        let star = Body::new(0.0, 0.0, 0.0, 0.0, 800.0, 20.0, BodyType::Star);
-        let planet = Body::new(15.0, 0.0, -5.0, 2.0, 15.0, 4.0, BodyType::Planet);
-        let input_ke = ke_of(&[star.clone(), planet.clone()]);
-        let result = compute_collision_outcome(&star, &planet, 10);
-        let output_ke = ke_of(&result);
-        assert!(output_ke <= input_ke + 1e-10,
-            "Star absorption KE increased: {output_ke} > {input_ke}");
-    }
-
-    #[test]
-    fn star_absorption_momentum_conserved() {
-        let star = Body::new(0.0, 0.0, 1.0, -0.5, 800.0, 20.0, BodyType::Star);
-        let planet = Body::new(15.0, 0.0, -10.0, 3.0, 15.0, 4.0, BodyType::Planet);
-        let (ipx, ipy) = momentum_of(&[star.clone(), planet.clone()]);
-        let result = compute_collision_outcome(&star, &planet, 10);
-        let (opx, opy) = momentum_of(&result);
-        assert!((opx - ipx).abs() < 1e-8,
-            "Star momentum X: got {opx}, expected {ipx}");
-        assert!((opy - ipy).abs() < 1e-8,
-            "Star momentum Y: got {opy}, expected {ipy}");
+            "Star merge mass: got {output}, expected {input}");
     }
 
     // ---- Fragment count bounds ----
 
     #[test]
     fn fragment_count_bounded() {
-        let a = Body::new(0.0, 0.0, 200.0, 0.0, 500.0, 15.0, BodyType::Star);
-        let b = Body::new(20.0, 0.0, -200.0, 0.0, 500.0, 15.0, BodyType::Star);
+        // Two heavy bodies at extreme speed — should produce max ~6 fragments
+        let a = Body::new(0.0, 0.0, 200.0, 0.0, 200.0, 10.0, BodyType::Heavy);
+        let b = Body::new(15.0, 0.0, -200.0, 0.0, 200.0, 10.0, BodyType::Heavy);
         let result = compute_collision_outcome(&a, &b, 10);
-        assert!(result.len() <= 15,
-            "Too many fragments: {} (max should be ~14)", result.len());
+        assert!(result.len() <= 7,
+            "Too many fragments: {} (max should be ~6)", result.len());
     }
 
     #[test]
@@ -1301,18 +1259,45 @@ mod tests {
             "Asymmetric momentum Y: got {opy}, expected {ipy}");
     }
 
-    // ---- All fragments have cooldown ----
+    // ---- All fragments have long cooldown ----
 
     #[test]
-    fn fragments_have_cooldown() {
-        let a = Body::new(0.0, 0.0, 30.0, 0.0, 100.0, 8.0, BodyType::Heavy);
-        let b = Body::new(12.0, 0.0, -30.0, 0.0, 100.0, 8.0, BodyType::Heavy);
+    fn fragments_have_long_cooldown() {
+        let a = Body::new(0.0, 0.0, 100.0, 0.0, 150.0, 9.0, BodyType::Heavy);
+        let b = Body::new(14.0, 0.0, -100.0, 0.0, 150.0, 9.0, BodyType::Heavy);
         let result = compute_collision_outcome(&a, &b, 10);
         if result.len() > 1 {
             for (i, frag) in result.iter().enumerate() {
-                assert!(frag.cooldown > 0.0,
-                    "Fragment {i} has no cooldown ({})!", frag.cooldown);
+                assert!(frag.cooldown >= 30.0,
+                    "Fragment {i} cooldown too short: {}!", frag.cooldown);
             }
         }
+    }
+
+    // ---- KE is significantly dissipated (not just 5%) ----
+
+    #[test]
+    fn fragmentation_dissipates_ke_heavily() {
+        let a = Body::new(0.0, 0.0, 100.0, 0.0, 150.0, 9.0, BodyType::Heavy);
+        let b = Body::new(14.0, 0.0, -100.0, 0.0, 150.0, 9.0, BodyType::Heavy);
+        let input_ke = ke_of(&[a.clone(), b.clone()]);
+        let result = compute_collision_outcome(&a, &b, 10);
+        let output_ke = ke_of(&result);
+        // Should lose at least 30% of total KE
+        assert!(output_ke < input_ke * 0.70,
+            "Not enough dissipation: output {output_ke} vs input {input_ke} (ratio {:.2})",
+            output_ke / input_ke);
+    }
+
+    // ---- Moderate velocity still merges (η < 1.5 threshold) ----
+
+    #[test]
+    fn moderate_velocity_still_merges() {
+        // v_rel=3 → η≈0.72, well below the 1.5 threshold
+        let a = Body::new(0.0, 0.0, 1.5, 0.0, 100.0, 8.0, BodyType::Heavy);
+        let b = Body::new(12.0, 0.0, -1.5, 0.0, 100.0, 8.0, BodyType::Heavy);
+        let result = compute_collision_outcome(&a, &b, 10);
+        assert_eq!(result.len(), 1,
+            "Moderate velocity (η<1.5) should merge, got {} fragments", result.len());
     }
 }
