@@ -427,11 +427,11 @@ fn compute_collision_outcome(a: &Body, b: &Body, body_count: usize) -> Vec<Body>
     };
 
     let n_medium = if star_absorbs { 0 }
-        else { ((1.0 + eta * 1.2).min(5.0)) as usize };
+        else { ((1.0 + eta * 0.8).min(3.0)) as usize };
     let n_small = if star_absorbs {
-        ((3.0 + eta * 2.0).min(8.0)) as usize
+        ((2.0 + eta).min(5.0)) as usize
     } else {
-        ((4.0 + eta * 4.0).min(22.0)) as usize
+        ((3.0 + eta * 2.0).min(10.0)) as usize
     };
 
     // ---- Build mass array, then NORMALIZE to exact total_mass ----
@@ -1078,5 +1078,241 @@ async fn main() {
 
         flash.draw();
         next_frame().await;
+    }
+}
+
+// ============================================================
+// TESTS — verify conservation laws and fragment bounds
+// ============================================================
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ke_of(bodies: &[Body]) -> f64 {
+        bodies.iter().map(|b| 0.5 * b.mass * (b.vx * b.vx + b.vy * b.vy)).sum()
+    }
+
+    fn mass_of(bodies: &[Body]) -> f64 {
+        bodies.iter().map(|b| b.mass).sum()
+    }
+
+    fn momentum_of(bodies: &[Body]) -> (f64, f64) {
+        (
+            bodies.iter().map(|b| b.mass * b.vx).sum(),
+            bodies.iter().map(|b| b.mass * b.vy).sum(),
+        )
+    }
+
+    // ---- Low-energy merge ----
+
+    #[test]
+    fn low_energy_merges_into_one_body() {
+        let a = Body::new(0.0, 0.0, 0.1, 0.0, 50.0, 5.0, BodyType::Planet);
+        let b = Body::new(8.0, 0.0, -0.1, 0.0, 50.0, 5.0, BodyType::Planet);
+        let result = compute_collision_outcome(&a, &b, 10);
+        assert_eq!(result.len(), 1, "Low-energy collision should merge into 1 body");
+    }
+
+    #[test]
+    fn low_energy_merge_conserves_mass() {
+        let a = Body::new(0.0, 0.0, 0.1, 0.0, 50.0, 5.0, BodyType::Planet);
+        let b = Body::new(8.0, 0.0, -0.1, 0.0, 50.0, 5.0, BodyType::Planet);
+        let input = a.mass + b.mass;
+        let result = compute_collision_outcome(&a, &b, 10);
+        let output = mass_of(&result);
+        assert!((output - input).abs() < 1e-10,
+            "Merge mass: got {output}, expected {input}");
+    }
+
+    #[test]
+    fn low_energy_merge_ke_does_not_increase() {
+        let a = Body::new(0.0, 0.0, 0.5, 0.3, 50.0, 5.0, BodyType::Planet);
+        let b = Body::new(8.0, 0.0, -0.5, -0.3, 50.0, 5.0, BodyType::Planet);
+        let input_ke = ke_of(&[a.clone(), b.clone()]);
+        let result = compute_collision_outcome(&a, &b, 10);
+        let output_ke = ke_of(&result);
+        assert!(output_ke <= input_ke + 1e-10,
+            "Merge KE increased: {output_ke} > {input_ke}");
+    }
+
+    // ---- High-velocity fragmentation ----
+
+    #[test]
+    fn high_velocity_conserves_mass() {
+        let a = Body::new(0.0, 0.0, 30.0, 5.0, 100.0, 8.0, BodyType::Heavy);
+        let b = Body::new(12.0, 0.0, -30.0, -5.0, 120.0, 9.0, BodyType::Heavy);
+        let input = a.mass + b.mass;
+        let result = compute_collision_outcome(&a, &b, 10);
+        let output = mass_of(&result);
+        assert!((output - input).abs() < 1e-10,
+            "High-velocity mass: got {output}, expected {input}");
+    }
+
+    #[test]
+    fn high_velocity_ke_does_not_increase() {
+        let a = Body::new(0.0, 0.0, 30.0, 5.0, 100.0, 8.0, BodyType::Heavy);
+        let b = Body::new(12.0, 0.0, -30.0, -5.0, 120.0, 9.0, BodyType::Heavy);
+        let input_ke = ke_of(&[a.clone(), b.clone()]);
+        let result = compute_collision_outcome(&a, &b, 10);
+        let output_ke = ke_of(&result);
+        assert!(output_ke <= input_ke + 1e-10,
+            "High-velocity KE increased: {output_ke} > {input_ke}");
+    }
+
+    #[test]
+    fn high_velocity_momentum_conserved() {
+        let a = Body::new(0.0, 0.0, 30.0, 5.0, 100.0, 8.0, BodyType::Heavy);
+        let b = Body::new(12.0, 0.0, -30.0, -5.0, 120.0, 9.0, BodyType::Heavy);
+        let (ipx, ipy) = momentum_of(&[a.clone(), b.clone()]);
+        let result = compute_collision_outcome(&a, &b, 10);
+        let (opx, opy) = momentum_of(&result);
+        assert!((opx - ipx).abs() < 1e-8,
+            "Momentum X: got {opx}, expected {ipx}");
+        assert!((opy - ipy).abs() < 1e-8,
+            "Momentum Y: got {opy}, expected {ipy}");
+    }
+
+    // ---- Extreme velocity (super-catastrophic) ----
+
+    #[test]
+    fn extreme_velocity_conserves_mass() {
+        let a = Body::new(0.0, 0.0, 100.0, 50.0, 200.0, 10.0, BodyType::Heavy);
+        let b = Body::new(15.0, 0.0, -100.0, -50.0, 200.0, 10.0, BodyType::Heavy);
+        let input = a.mass + b.mass;
+        let result = compute_collision_outcome(&a, &b, 10);
+        let output = mass_of(&result);
+        assert!((output - input).abs() < 1e-10,
+            "Extreme mass: got {output}, expected {input}");
+    }
+
+    #[test]
+    fn extreme_velocity_ke_does_not_increase() {
+        let a = Body::new(0.0, 0.0, 100.0, 50.0, 200.0, 10.0, BodyType::Heavy);
+        let b = Body::new(15.0, 0.0, -100.0, -50.0, 200.0, 10.0, BodyType::Heavy);
+        let input_ke = ke_of(&[a.clone(), b.clone()]);
+        let result = compute_collision_outcome(&a, &b, 10);
+        let output_ke = ke_of(&result);
+        assert!(output_ke <= input_ke + 1e-10,
+            "Extreme KE increased: {output_ke} > {input_ke}");
+    }
+
+    #[test]
+    fn extreme_velocity_momentum_conserved() {
+        let a = Body::new(0.0, 0.0, 100.0, 50.0, 200.0, 10.0, BodyType::Heavy);
+        let b = Body::new(15.0, 0.0, -100.0, -50.0, 200.0, 10.0, BodyType::Heavy);
+        let (ipx, ipy) = momentum_of(&[a.clone(), b.clone()]);
+        let result = compute_collision_outcome(&a, &b, 10);
+        let (opx, opy) = momentum_of(&result);
+        assert!((opx - ipx).abs() < 1e-8,
+            "Extreme momentum X: got {opx}, expected {ipx}");
+        assert!((opy - ipy).abs() < 1e-8,
+            "Extreme momentum Y: got {opy}, expected {ipy}");
+    }
+
+    // ---- Star absorption ----
+
+    #[test]
+    fn star_absorption_conserves_mass() {
+        let star = Body::new(0.0, 0.0, 0.0, 0.0, 800.0, 20.0, BodyType::Star);
+        let planet = Body::new(15.0, 0.0, -5.0, 2.0, 15.0, 4.0, BodyType::Planet);
+        let input = star.mass + planet.mass;
+        let result = compute_collision_outcome(&star, &planet, 10);
+        let output = mass_of(&result);
+        assert!((output - input).abs() < 1e-10,
+            "Star absorption mass: got {output}, expected {input}");
+    }
+
+    #[test]
+    fn star_absorption_ke_does_not_increase() {
+        let star = Body::new(0.0, 0.0, 0.0, 0.0, 800.0, 20.0, BodyType::Star);
+        let planet = Body::new(15.0, 0.0, -5.0, 2.0, 15.0, 4.0, BodyType::Planet);
+        let input_ke = ke_of(&[star.clone(), planet.clone()]);
+        let result = compute_collision_outcome(&star, &planet, 10);
+        let output_ke = ke_of(&result);
+        assert!(output_ke <= input_ke + 1e-10,
+            "Star absorption KE increased: {output_ke} > {input_ke}");
+    }
+
+    #[test]
+    fn star_absorption_momentum_conserved() {
+        let star = Body::new(0.0, 0.0, 1.0, -0.5, 800.0, 20.0, BodyType::Star);
+        let planet = Body::new(15.0, 0.0, -10.0, 3.0, 15.0, 4.0, BodyType::Planet);
+        let (ipx, ipy) = momentum_of(&[star.clone(), planet.clone()]);
+        let result = compute_collision_outcome(&star, &planet, 10);
+        let (opx, opy) = momentum_of(&result);
+        assert!((opx - ipx).abs() < 1e-8,
+            "Star momentum X: got {opx}, expected {ipx}");
+        assert!((opy - ipy).abs() < 1e-8,
+            "Star momentum Y: got {opy}, expected {ipy}");
+    }
+
+    // ---- Fragment count bounds ----
+
+    #[test]
+    fn fragment_count_bounded() {
+        let a = Body::new(0.0, 0.0, 200.0, 0.0, 500.0, 15.0, BodyType::Star);
+        let b = Body::new(20.0, 0.0, -200.0, 0.0, 500.0, 15.0, BodyType::Star);
+        let result = compute_collision_outcome(&a, &b, 10);
+        assert!(result.len() <= 15,
+            "Too many fragments: {} (max should be ~14)", result.len());
+    }
+
+    #[test]
+    fn body_count_limit_forces_merge() {
+        let a = Body::new(0.0, 0.0, 50.0, 0.0, 100.0, 8.0, BodyType::Heavy);
+        let b = Body::new(12.0, 0.0, -50.0, 0.0, 100.0, 8.0, BodyType::Heavy);
+        let result = compute_collision_outcome(&a, &b, MAX_BODIES + 1);
+        assert_eq!(result.len(), 1,
+            "Should force merge when body count exceeds MAX_BODIES");
+    }
+
+    #[test]
+    fn tiny_bodies_always_merge() {
+        let a = Body::new(0.0, 0.0, 20.0, 0.0, 2.0, 1.0, BodyType::Asteroid);
+        let b = Body::new(2.0, 0.0, -20.0, 0.0, 3.0, 1.2, BodyType::Asteroid);
+        let result = compute_collision_outcome(&a, &b, 10);
+        assert_eq!(result.len(), 1,
+            "Tiny bodies (total mass < 6) should always merge");
+    }
+
+    // ---- Asymmetric collisions ----
+
+    #[test]
+    fn asymmetric_mass_conserves_all() {
+        let a = Body::new(0.0, 0.0, 15.0, -8.0, 300.0, 12.0, BodyType::Heavy);
+        let b = Body::new(18.0, 0.0, -25.0, 4.0, 30.0, 4.0, BodyType::Planet);
+        let input_mass = a.mass + b.mass;
+        let input_ke = ke_of(&[a.clone(), b.clone()]);
+        let (ipx, ipy) = momentum_of(&[a.clone(), b.clone()]);
+
+        let result = compute_collision_outcome(&a, &b, 10);
+
+        let output_mass = mass_of(&result);
+        let output_ke = ke_of(&result);
+        let (opx, opy) = momentum_of(&result);
+
+        assert!((output_mass - input_mass).abs() < 1e-10,
+            "Asymmetric mass: got {output_mass}, expected {input_mass}");
+        assert!(output_ke <= input_ke + 1e-10,
+            "Asymmetric KE increased: {output_ke} > {input_ke}");
+        assert!((opx - ipx).abs() < 1e-8,
+            "Asymmetric momentum X: got {opx}, expected {ipx}");
+        assert!((opy - ipy).abs() < 1e-8,
+            "Asymmetric momentum Y: got {opy}, expected {ipy}");
+    }
+
+    // ---- All fragments have cooldown ----
+
+    #[test]
+    fn fragments_have_cooldown() {
+        let a = Body::new(0.0, 0.0, 30.0, 0.0, 100.0, 8.0, BodyType::Heavy);
+        let b = Body::new(12.0, 0.0, -30.0, 0.0, 100.0, 8.0, BodyType::Heavy);
+        let result = compute_collision_outcome(&a, &b, 10);
+        if result.len() > 1 {
+            for (i, frag) in result.iter().enumerate() {
+                assert!(frag.cooldown > 0.0,
+                    "Fragment {i} has no cooldown ({})!", frag.cooldown);
+            }
+        }
     }
 }
