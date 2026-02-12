@@ -34,6 +34,7 @@ struct Body {
     glow: Color,
     trail: VecDeque<(f64, f64)>,
     alive: bool,
+    cooldown: f64,
 }
 
 impl Body {
@@ -66,6 +67,7 @@ impl Body {
             x, y, vx, vy, mass, radius, body_type, fill, glow,
             trail: VecDeque::with_capacity(TRAIL_MAX + 1),
             alive: true,
+            cooldown: 0.0,
         }
     }
 }
@@ -331,15 +333,19 @@ fn step_physics(bodies: &mut Vec<Body>, dt: f64) {
         if bodies[i].trail.len() > TRAIL_MAX {
             bodies[i].trail.pop_front();
         }
+
+        if bodies[i].cooldown > 0.0 {
+            bodies[i].cooldown -= dt;
+        }
     }
 
-    // Realistic collisions: merge, fragment, or shatter depending on impact energy
+    // Realistic collisions — skip bodies still on cooldown
     let len = bodies.len();
     let mut new_bodies: Vec<Body> = Vec::new();
     for i in 0..len {
-        if !bodies[i].alive { continue; }
+        if !bodies[i].alive || bodies[i].cooldown > 0.0 { continue; }
         for j in (i + 1)..len {
-            if !bodies[j].alive { continue; }
+            if !bodies[j].alive || bodies[j].cooldown > 0.0 { continue; }
             let dx = bodies[j].x - bodies[i].x;
             let dy = bodies[j].y - bodies[i].y;
             let dist_sq = dx * dx + dy * dy;
@@ -359,7 +365,7 @@ fn step_physics(bodies: &mut Vec<Body>, dt: f64) {
 }
 
 // ============================================================
-// COLLISION OUTCOMES
+// COLLISION OUTCOMES — exact mass + energy conservation
 // ============================================================
 fn mass_to_radius(mass: f64) -> f64 {
     mass.max(0.3).powf(0.36) * 1.8
@@ -378,148 +384,153 @@ fn make_body(mass: f64, x: f64, y: f64, vx: f64, vy: f64) -> Body {
     Body::new(x, y, vx, vy, mass, radius, btype)
 }
 
-/// Adjust velocities so total momentum exactly equals target
-fn correct_momentum(frags: &mut [Body], target_px: f64, target_py: f64) {
-    let total_m: f64 = frags.iter().map(|b| b.mass).sum();
-    if total_m < 0.001 { return; }
-    let actual_px: f64 = frags.iter().map(|b| b.vx * b.mass).sum();
-    let actual_py: f64 = frags.iter().map(|b| b.vy * b.mass).sum();
-    let dvx = (target_px - actual_px) / total_m;
-    let dvy = (target_py - actual_py) / total_m;
-    for b in frags.iter_mut() {
-        b.vx += dvx;
-        b.vy += dvy;
-    }
-}
-
 fn compute_collision_outcome(a: &Body, b: &Body, body_count: usize) -> Vec<Body> {
     let total_mass = a.mass + b.mass;
     let reduced_mass = a.mass * b.mass / total_mass;
 
-    // Center-of-mass position & velocity (conserved)
+    // Center-of-mass position & velocity (conserved quantities)
     let com_x = (a.x * a.mass + b.x * b.mass) / total_mass;
     let com_y = (a.y * a.mass + b.y * b.mass) / total_mass;
     let com_vx = (a.vx * a.mass + b.vx * b.mass) / total_mass;
     let com_vy = (a.vy * a.mass + b.vy * b.mass) / total_mass;
 
-    // Relative velocity → kinetic energy in COM frame
+    // Kinetic energy available in COM frame
     let rel_vx = a.vx - b.vx;
     let rel_vy = a.vy - b.vy;
-    let rel_speed = (rel_vx * rel_vx + rel_vy * rel_vy).sqrt();
-    let ke = 0.5 * reduced_mass * rel_speed * rel_speed;
+    let ke_com = 0.5 * reduced_mass * (rel_vx * rel_vx + rel_vy * rel_vy);
 
-    // Gravitational binding energy
+    // Energy ratio: KE vs binding energy
     let sep = (a.radius + b.radius).max(1.0);
     let binding = G * a.mass * b.mass / sep;
-    let eta = ke / binding.max(0.001);
+    let eta = ke_com / binding.max(0.001);
 
     let collision_r = a.radius + b.radius;
-    let target_px = com_vx * total_mass;
-    let target_py = com_vy * total_mass;
 
-    // --- Force simple merge when body count is high or masses are tiny ---
+    // ---- Simple merge: low energy, tiny bodies, or too many bodies ----
     if body_count > MAX_BODIES || total_mass < 6.0 || eta < 0.3 {
         return vec![make_body(total_mass, com_x, com_y, com_vx, com_vy)];
     }
 
-    // --- Star absorption: star survives, sprays minor debris ---
-    if (a.body_type == BodyType::Star || b.body_type == BodyType::Star)
-        && (eta < 2.0 || a.mass.min(b.mass) < a.mass.max(b.mass) * 0.3)
-    {
-        let star_frac = 0.92 - (eta * 0.04).min(0.15);
-        let star_mass = total_mass * star_frac;
-        let debris_mass = total_mass - star_mass;
-        let n_debris = (3.0 + eta * 2.0).min(8.0) as usize;
-        let per = debris_mass / n_debris as f64;
+    // ---- Determine fragment count and mass distribution ----
+    let is_star = a.body_type == BodyType::Star || b.body_type == BodyType::Star;
+    let star_absorbs = is_star
+        && (eta < 2.0 || a.mass.min(b.mass) < a.mass.max(b.mass) * 0.3);
 
-        let mut result = vec![make_body(star_mass, com_x, com_y, com_vx, com_vy)];
-        for _ in 0..n_debris {
-            let angle = rand::gen_range(0.0, std::f64::consts::TAU);
-            let speed = rel_speed * rand::gen_range(0.2, 0.7);
-            let dist = collision_r * rand::gen_range(1.0, 2.0);
-            result.push(make_body(
-                per.max(0.3),
-                com_x + angle.cos() * dist,
-                com_y + angle.sin() * dist,
-                com_vx + angle.cos() * speed,
-                com_vy + angle.sin() * speed,
-            ));
-        }
-        correct_momentum(&mut result, target_px, target_py);
-        return result;
-    }
-
-    // --- Fragmentation: severity scales with energy ratio η ---
-    //
-    //  η < 1.0  →  Partial fragmentation   (largest ~55-70%)
-    //  η < 3.0  →  Catastrophic disruption  (largest ~30-40%)
-    //  η ≥ 3.0  →  Super-catastrophic       (largest ~8-20%)
-
-    let largest_frac = if eta < 1.0 {
-        0.70 - 0.15 * eta           // 70% → 55%
+    let largest_frac = if star_absorbs {
+        0.92 - (eta * 0.04).min(0.15)
+    } else if eta < 1.0 {
+        0.70 - 0.15 * eta
     } else if eta < 3.0 {
-        0.55 - 0.125 * (eta - 1.0)  // 55% → 30%
+        0.55 - 0.125 * (eta - 1.0)
     } else {
-        (0.20 - 0.02 * (eta - 3.0)).max(0.08) // 20% → min 8%
+        (0.20 - 0.02 * (eta - 3.0)).max(0.08)
     };
 
-    let n_medium = ((1.0 + eta * 1.2).min(5.0)) as usize;
-    let n_small  = ((4.0 + eta * 4.0).min(22.0)) as usize;
-    let eject_speed = rel_speed * 0.25 * eta.sqrt().min(2.5);
+    let n_medium = if star_absorbs { 0 }
+        else { ((1.0 + eta * 1.2).min(5.0)) as usize };
+    let n_small = if star_absorbs {
+        ((3.0 + eta * 2.0).min(8.0)) as usize
+    } else {
+        ((4.0 + eta * 4.0).min(22.0)) as usize
+    };
 
-    let mut result: Vec<Body> = Vec::new();
-    let mut remaining = total_mass;
+    // ---- Build mass array, then NORMALIZE to exact total_mass ----
+    let total_frags = 1 + n_medium + n_small;
+    let mut masses = Vec::with_capacity(total_frags);
 
-    // Largest fragment — stays near collision center
-    let m_largest = total_mass * largest_frac;
-    remaining -= m_largest;
-    let a0 = rand::gen_range(0.0, std::f64::consts::TAU);
-    result.push(make_body(
-        m_largest,
-        com_x + a0.cos() * collision_r * 0.2,
-        com_y + a0.sin() * collision_r * 0.2,
-        com_vx + a0.cos() * eject_speed * 0.3,
-        com_vy + a0.sin() * eject_speed * 0.3,
-    ));
+    // Largest fragment
+    masses.push(largest_frac);
 
-    // Medium chunks — ejected outward
+    // Medium chunks
     for _ in 0..n_medium {
-        if remaining < 2.0 { break; }
-        let frac = rand::gen_range(0.06, 0.14);
-        let m = (total_mass * frac).min(remaining * 0.6);
-        remaining -= m;
-        let angle = rand::gen_range(0.0, std::f64::consts::TAU);
-        let dist = collision_r * rand::gen_range(0.8, 2.0);
-        let speed = eject_speed * rand::gen_range(0.6, 1.4);
+        masses.push(rand::gen_range(0.06, 0.14));
+    }
+
+    // Small debris
+    for _ in 0..n_small {
+        masses.push(rand::gen_range(0.005, 0.03));
+    }
+
+    // Normalize: exact mass conservation
+    let raw_sum: f64 = masses.iter().sum();
+    for m in masses.iter_mut() {
+        *m = (*m / raw_sum) * total_mass;
+    }
+
+    // ---- Place fragments spatially around collision center ----
+    let mut result: Vec<Body> = Vec::with_capacity(total_frags);
+    for (i, &m) in masses.iter().enumerate() {
+        let angle = (i as f64 / total_frags as f64) * std::f64::consts::TAU
+            + rand::gen_range(-0.3, 0.3);
+        let dist = if i == 0 {
+            collision_r * 0.2
+        } else if i <= n_medium {
+            collision_r * rand::gen_range(1.5, 3.0)
+        } else {
+            collision_r * rand::gen_range(2.0, 4.5)
+        };
         result.push(make_body(
             m,
             com_x + angle.cos() * dist,
             com_y + angle.sin() * dist,
-            com_vx + angle.cos() * speed,
-            com_vy + angle.sin() * speed,
+            0.0, 0.0, // velocities assigned below
         ));
     }
 
-    // Small debris — sprayed in all directions
-    if n_small > 0 && remaining > 0.5 {
-        let per = remaining / n_small as f64;
-        for _ in 0..n_small {
-            let m = (per * rand::gen_range(0.3, 1.7)).max(0.3);
-            let angle = rand::gen_range(0.0, std::f64::consts::TAU);
-            let dist = collision_r * rand::gen_range(0.5, 3.0);
-            let speed = eject_speed * rand::gen_range(0.5, 2.2);
-            result.push(make_body(
-                m,
-                com_x + angle.cos() * dist,
-                com_y + angle.sin() * dist,
-                com_vx + angle.cos() * speed,
-                com_vy + angle.sin() * speed,
-            ));
+    // ---- Assign velocities with EXACT momentum + energy conservation ----
+    //
+    // Work in the COM frame where total momentum = 0 by construction.
+    //   1. Give each fragment a random direction, speed ∝ 1/√mass (lighter = faster)
+    //   2. Subtract mass-weighted mean to enforce Σ(m_i * v_i) = 0
+    //   3. Scale all speeds uniformly so Σ(½ m_i |v_i|²) = target KE
+    //   4. Boost all by (com_vx, com_vy) → lab frame
+    //
+    // This guarantees:
+    //   Total momentum = M * com_v  (exact)
+    //   Total KE ≤ original KE      (exact, with 5% dissipation for inelasticity)
+
+    let dissipation = 0.95; // 5% lost to "heat" — prevents energy build-up
+    let target_ke = ke_com * dissipation;
+
+    // Step 1: random directions, speed ∝ 1/√m
+    let mut vels: Vec<(f64, f64)> = result.iter().map(|b| {
+        let ang = rand::gen_range(0.0, std::f64::consts::TAU);
+        let spd = 1.0 / b.mass.sqrt();
+        (ang.cos() * spd, ang.sin() * spd)
+    }).collect();
+
+    // Step 2: zero-center momentum in COM frame
+    let frag_m_total: f64 = result.iter().map(|b| b.mass).sum();
+    let px: f64 = result.iter().zip(vels.iter()).map(|(b, v)| b.mass * v.0).sum();
+    let py: f64 = result.iter().zip(vels.iter()).map(|(b, v)| b.mass * v.1).sum();
+    for v in vels.iter_mut() {
+        v.0 -= px / frag_m_total;
+        v.1 -= py / frag_m_total;
+    }
+
+    // Step 3: scale to exact target KE in COM frame
+    let raw_ke: f64 = result.iter().zip(vels.iter())
+        .map(|(b, v)| 0.5 * b.mass * (v.0 * v.0 + v.1 * v.1))
+        .sum();
+    if raw_ke > 1e-10 {
+        let scale = (target_ke / raw_ke).sqrt();
+        for v in vels.iter_mut() {
+            v.0 *= scale;
+            v.1 *= scale;
         }
     }
 
-    // Enforce momentum conservation
-    correct_momentum(&mut result, target_px, target_py);
+    // Step 4: boost to lab frame
+    for (b, v) in result.iter_mut().zip(vels.iter()) {
+        b.vx = com_vx + v.0;
+        b.vy = com_vy + v.1;
+    }
+
+    // Cooldown: prevent fragments from immediately re-colliding
+    for b in result.iter_mut() {
+        b.cooldown = 0.5;
+    }
+
     result
 }
 
