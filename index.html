@@ -26,7 +26,8 @@ canvas{display:block}
 </div>
 <div id="help">
   <b>click</b> place &nbsp; <b>drag</b> launch &nbsp; <b>1</b> planet &nbsp; <b>2</b> giant &nbsp; <b>3</b> star &nbsp; <b>4</b> asteroids<br>
-  <b>T</b> trails &nbsp; <b>G</b> grid &nbsp; <b>F</b> pause &nbsp; <b>C</b> clear &nbsp; <b>X</b> explode &nbsp; <b>scroll</b> speed &nbsp; <b>space</b> new system
+  <b>T</b> trails &nbsp; <b>O</b> orbits &nbsp; <b>G</b> grid &nbsp; <b>F</b> pause &nbsp; <b>C</b> clear &nbsp; <b>X</b> explode &nbsp; <b>space</b> new system<br>
+  <b>pinch</b> zoom &nbsp; <b>scroll</b> pan &nbsp; <b>[</b> <b>]</b> time scale &nbsp; <b>H</b> recenter
 </div>
 <div id="msg"></div>
 
@@ -44,6 +45,10 @@ var W = 0, H = 0;
 var camX = 0, camY = 0;       // current camera offset (world coords of screen center)
 var camTargX = 0, camTargY = 0; // target (center of mass)
 var camSmooth = 0.05;          // lerp factor
+var camZoom = 1;               // zoom level
+var camZoomTarg = 1;
+var camManualOffset = false;   // true when user is panning manually
+var camOffX = 0, camOffY = 0;  // manual pan offset from center of mass
 
 function resize() {
   W = canvas.width = window.innerWidth;
@@ -53,9 +58,12 @@ function resize() {
 window.addEventListener('resize', resize);
 resize();
 
-// Convert screen coords to world coords
+// Convert screen coords to world coords (accounts for zoom)
 function screenToWorld(sx, sy) {
-  return { x: sx + camX - W / 2, y: sy + camY - H / 2 };
+  return {
+    x: (sx - W / 2) / camZoom + camX,
+    y: (sy - H / 2) / camZoom + camY
+  };
 }
 
 // Compute center of mass
@@ -385,6 +393,79 @@ function previewRadius() {
 }
 
 // ============================================================
+// PROJECTED ORBITS — show predicted paths for all bodies
+// ============================================================
+var showOrbits = true;
+
+function drawProjectedOrbits() {
+  if (!showOrbits) return;
+  if (bodies.length < 2) return;
+
+  // Make a lightweight copy of body positions/velocities for simulation
+  var sim = [];
+  for (var i = 0; i < bodies.length; i++) {
+    var b = bodies[i];
+    sim.push({ x: b.x, y: b.y, vx: b.vx, vy: b.vy, mass: b.mass, radius: b.radius });
+  }
+
+  // We'll store paths: paths[i] = [x0,y0, x1,y1, ...]
+  var paths = [];
+  for (var i = 0; i < sim.length; i++) {
+    paths.push([sim[i].x, sim[i].y]);
+  }
+
+  // Forward simulate ~200 steps
+  var predSteps = 200;
+  var predDt = 1.0;
+  for (var step = 0; step < predSteps; step++) {
+    // Gravity
+    for (var i = 0; i < sim.length; i++) {
+      for (var j = i + 1; j < sim.length; j++) {
+        var dx = sim[j].x - sim[i].x;
+        var dy = sim[j].y - sim[i].y;
+        var distSq = dx * dx + dy * dy + SOFTENING * SOFTENING;
+        var dist = Math.sqrt(distSq);
+        var force = G_CONST * sim[i].mass * sim[j].mass / distSq;
+        var fx = force * dx / dist;
+        var fy = force * dy / dist;
+        sim[i].vx += fx / sim[i].mass * predDt;
+        sim[i].vy += fy / sim[i].mass * predDt;
+        sim[j].vx -= fx / sim[j].mass * predDt;
+        sim[j].vy -= fy / sim[j].mass * predDt;
+      }
+    }
+    // Integrate
+    for (var i = 0; i < sim.length; i++) {
+      sim[i].x += sim[i].vx * predDt;
+      sim[i].y += sim[i].vy * predDt;
+      // Record every 2nd step to keep it light
+      if (step % 2 === 0) {
+        paths[i].push(sim[i].x, sim[i].y);
+      }
+    }
+  }
+
+  // Draw projected paths
+  ctx.setLineDash([3, 6]);
+  for (var i = 0; i < bodies.length; i++) {
+    var p = paths[i];
+    if (p.length < 4) continue;
+    ctx.beginPath();
+    ctx.moveTo(p[0], p[1]);
+    for (var j = 2; j < p.length; j += 2) {
+      ctx.lineTo(p[j], p[j + 1]);
+    }
+    var b = bodies[i];
+    ctx.strokeStyle = b.type === 'asteroid' ? 'rgba(150,150,150,0.06)' : b.glow;
+    ctx.globalAlpha = b.type === 'asteroid' ? 0.06 : 0.15;
+    ctx.lineWidth = 1;
+    ctx.stroke();
+  }
+  ctx.setLineDash([]);
+  ctx.globalAlpha = 1;
+}
+
+// ============================================================
 // INPUT
 // ============================================================
 var mouseX = 0, mouseY = 0;
@@ -409,9 +490,21 @@ canvas.addEventListener('mouseup', function(e) {
   placeBody(wp.x, wp.y, vx, vy);
 });
 canvas.addEventListener('contextmenu', function(e) { e.preventDefault(); });
+
+// Wheel / trackpad: pan with scroll, pinch-to-zoom with ctrlKey (trackpad pinch sends ctrl+wheel)
 canvas.addEventListener('wheel', function(e) {
-  timeScale = Math.max(0.1, Math.min(5, timeScale + (e.deltaY > 0 ? -0.15 : 0.15)));
-});
+  e.preventDefault();
+  if (e.ctrlKey) {
+    // Pinch to zoom (trackpad pinch gesture sends ctrlKey + deltaY)
+    var zoomDelta = -e.deltaY * 0.01;
+    camZoomTarg = Math.max(0.15, Math.min(8, camZoomTarg * (1 + zoomDelta)));
+  } else {
+    // Two-finger scroll = pan
+    camManualOffset = true;
+    camOffX += e.deltaX / camZoom;
+    camOffY += e.deltaY / camZoom;
+  }
+}, {passive: false});
 
 // Touch
 canvas.addEventListener('touchstart', function(e) {
@@ -462,16 +555,34 @@ function showMsg(text) {
 }
 
 window.addEventListener('keydown', function(e) {
-  var k = e.key.toLowerCase();
-  if (k === '1') { placeMode = 'planet'; showMsg('PLANET'); }
-  if (k === '2') { placeMode = 'heavy'; showMsg('GIANT'); }
-  if (k === '3') { placeMode = 'star'; showMsg('STAR'); }
-  if (k === '4') { placeMode = 'asteroids'; showMsg('ASTEROIDS'); }
-  if (k === 't') { showTrails = !showTrails; showMsg(showTrails ? 'TRAILS ON' : 'TRAILS OFF'); }
-  if (k === 'g') { showGrid = !showGrid; showMsg(showGrid ? 'GRID ON' : 'GRID OFF'); }
-  if (k === 'f') { paused = !paused; showMsg(paused ? 'PAUSED' : 'RUNNING'); }
-  if (k === 'c') { bodies = []; showMsg('CLEARED'); }
-  if (k === 'x') {
+  var k = e.key;
+  var kl = k.toLowerCase();
+  if (kl === '1') { placeMode = 'planet'; showMsg('PLANET'); }
+  if (kl === '2') { placeMode = 'heavy'; showMsg('GIANT'); }
+  if (kl === '3') { placeMode = 'star'; showMsg('STAR'); }
+  if (kl === '4') { placeMode = 'asteroids'; showMsg('ASTEROIDS'); }
+  if (kl === 't') { showTrails = !showTrails; showMsg(showTrails ? 'TRAILS ON' : 'TRAILS OFF'); }
+  if (kl === 'g') { showGrid = !showGrid; showMsg(showGrid ? 'GRID ON' : 'GRID OFF'); }
+  if (kl === 'o') { showOrbits = !showOrbits; showMsg(showOrbits ? 'ORBITS ON' : 'ORBITS OFF'); }
+  if (kl === 'f') { paused = !paused; showMsg(paused ? 'PAUSED' : 'RUNNING'); }
+  if (kl === 'c') { bodies = []; showMsg('CLEARED'); }
+  if (kl === 'h') {
+    // Re-center camera on center of mass
+    camManualOffset = false;
+    camOffX = 0; camOffY = 0;
+    camZoomTarg = 1;
+    showMsg('CENTERED');
+  }
+  // Time scale with [ and ]
+  if (k === '[' || k === '{') {
+    timeScale = Math.max(0.1, timeScale / 1.5);
+    showMsg(timeScale.toFixed(1) + 'X');
+  }
+  if (k === ']' || k === '}') {
+    timeScale = Math.min(10, timeScale * 1.5);
+    showMsg(timeScale.toFixed(1) + 'X');
+  }
+  if (kl === 'x') {
     var com = getCenterOfMass();
     for (var i = 0; i < bodies.length; i++) {
       var b = bodies[i], dx = b.x - com.x, dy = b.y - com.y;
@@ -480,9 +591,8 @@ window.addEventListener('keydown', function(e) {
     }
     showMsg('BOOM');
   }
-  if (k === ' ') {
+  if (kl === ' ') {
     e.preventDefault();
-    // Spawn at current center of mass, or screen center if empty
     var sc = bodies.length > 0 ? getCenterOfMass() : { x: camX, y: camY };
     spawnSystem(sc.x, sc.y);
     showMsg('NEW SYSTEM');
@@ -515,12 +625,19 @@ function loop(now) {
     }
   }
 
-  // --- CAMERA: track center of mass ---
+  // --- CAMERA: track center of mass + manual offset ---
   var com = getCenterOfMass();
-  camTargX = com.x;
-  camTargY = com.y;
+  if (camManualOffset) {
+    camTargX = com.x + camOffX;
+    camTargY = com.y + camOffY;
+  } else {
+    camTargX = com.x;
+    camTargY = com.y;
+  }
   camX += (camTargX - camX) * camSmooth;
   camY += (camTargY - camY) * camSmooth;
+  // Smooth zoom
+  camZoom += (camZoomTarg - camZoom) * 0.1;
 
   // ---- RENDER ----
   ctx.globalAlpha = 1;
@@ -530,12 +647,17 @@ function loop(now) {
   // Background stars — drawn in screen space (don't move with camera)
   drawStarfield();
 
-  // Everything else in world space
+  // Everything else in world space (translated + scaled)
   ctx.save();
-  ctx.translate(W / 2 - camX, H / 2 - camY);
+  ctx.translate(W / 2, H / 2);
+  ctx.scale(camZoom, camZoom);
+  ctx.translate(-camX, -camY);
 
   // Grid
   drawGrid();
+
+  // Projected orbits (behind trails)
+  drawProjectedOrbits();
 
   // Trails
   for (var i = 0; i < bodies.length; i++) {
@@ -556,7 +678,7 @@ function loop(now) {
   // --- HUD (screen space) ---
   var totalMass = 0;
   for (var i = 0; i < bodies.length; i++) totalMass += bodies[i].mass;
-  statsEl.textContent = bodies.length + ' bodies \u00B7 ' + Math.round(totalMass) + ' mass \u00B7 ' + timeScale.toFixed(1) + 'x \u00B7 ' + placeMode;
+  statsEl.textContent = bodies.length + ' bodies \u00B7 ' + Math.round(totalMass) + ' mass \u00B7 ' + timeScale.toFixed(1) + 'x \u00B7 ' + Math.round(camZoom * 100) + '% \u00B7 ' + placeMode;
 }
 
 // ============================================================
