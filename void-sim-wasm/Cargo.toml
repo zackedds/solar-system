@@ -1,11 +1,10 @@
 [package]
-name = "void-sim"
+name = "void-sim-wasm"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
 macroquad = "0.4"
-rayon = "1.10"
 
 [profile.release]
 opt-level = 3

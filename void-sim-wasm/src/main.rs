@@ -1,18 +1,13 @@
 use macroquad::prelude::*;
-use macroquad::miniquad::window::set_mouse_cursor;
-use macroquad::miniquad::CursorIcon;
-use rayon::prelude::*;
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
-use std::sync::mpsc;
 
 // ============================================================
 // CONSTANTS
 // ============================================================
 const G: f64 = 0.5;
-const SOFTENING_SQ: f64 = 100.0; // precomputed SOFTENING^2
+const SOFTENING_SQ: f64 = 100.0;
 const TRAIL_MAX: usize = 200;
-const ORBIT_PREDICTION_STEPS: usize = 250;
+const ORBIT_PREDICTION_STEPS: usize = 200;
 
 // ============================================================
 // BODY
@@ -71,30 +66,6 @@ impl Body {
             trail: VecDeque::with_capacity(TRAIL_MAX + 1),
             alive: true,
         }
-    }
-}
-
-// ============================================================
-// SoA layout for hot physics data (cache-friendly)
-// ============================================================
-struct PhysicsArrays {
-    x: Vec<f64>,
-    y: Vec<f64>,
-    mass: Vec<f64>,
-}
-
-impl PhysicsArrays {
-    fn from_bodies(bodies: &[Body]) -> Self {
-        let len = bodies.len();
-        let mut x = Vec::with_capacity(len);
-        let mut y = Vec::with_capacity(len);
-        let mut mass = Vec::with_capacity(len);
-        for b in bodies {
-            x.push(b.x);
-            y.push(b.y);
-            mass.push(b.mass);
-        }
-        PhysicsArrays { x, y, mass }
     }
 }
 
@@ -175,7 +146,6 @@ impl Camera {
         self.offset_y = 0.0;
         self.zoom_target = 1.0;
     }
-
 }
 
 // ============================================================
@@ -197,9 +167,7 @@ impl FlashMsg {
     }
 
     fn update(&mut self, dt: f64) {
-        if self.timer > 0.0 {
-            self.timer -= dt;
-        }
+        if self.timer > 0.0 { self.timer -= dt; }
     }
 
     fn draw(&self) {
@@ -209,32 +177,21 @@ impl FlashMsg {
         let sh = screen_height();
         let size = 40.0;
         let dims = measure_text(&self.text, None, size as u16, 1.0);
-        draw_text(
-            &self.text,
-            sw / 2.0 - dims.width / 2.0,
-            sh / 2.0,
-            size,
-            Color::new(1.0, 1.0, 1.0, alpha),
-        );
+        draw_text(&self.text, sw / 2.0 - dims.width / 2.0, sh / 2.0, size, Color::new(1.0, 1.0, 1.0, alpha));
     }
 }
 
 // ============================================================
 // STARFIELD
 // ============================================================
-struct BgStar {
-    x: f32,
-    y: f32,
-    size: f32,
-    alpha: f32,
-}
+struct BgStar { x: f32, y: f32, size: f32, alpha: f32 }
 
 fn make_starfield(w: f32, h: f32) -> Vec<BgStar> {
-    (0..500)
+    (0..400)
         .map(|_| BgStar {
             x: rand::gen_range(0.0, w),
             y: rand::gen_range(0.0, h),
-            size: if rand::gen_range(0.0f32, 1.0) < 0.1 { 1.5 } else { 0.7 },
+            size: if rand::gen_range(0.0f32, 1.0) < 0.1 { 1.2 } else { 0.6 },
             alpha: 0.1 + rand::gen_range(0.0f32, 0.4),
         })
         .collect()
@@ -242,7 +199,7 @@ fn make_starfield(w: f32, h: f32) -> Vec<BgStar> {
 
 fn draw_starfield(stars: &[BgStar]) {
     for s in stars {
-        draw_rectangle(s.x, s.y, s.size, s.size, Color::new(0.7, 0.75, 0.8, s.alpha));
+        draw_rectangle(s.x, s.y, s.size, s.size, Color::new(0.67, 0.73, 0.8, s.alpha));
     }
 }
 
@@ -270,8 +227,8 @@ fn spawn_system(bodies: &mut Vec<Body>, cx: f64, cy: f64, base_vx: f64, base_vy:
         ));
     }
 
-    for _ in 0..25 {
-        let r = 410.0 + rand::gen_range(0.0, 70.0);
+    for _ in 0..20 {
+        let r = 410.0 + rand::gen_range(0.0, 60.0);
         let angle = rand::gen_range(0.0, std::f64::consts::TAU);
         let speed = (G * star_mass / r).sqrt() * (0.93 + rand::gen_range(0.0, 0.14));
         bodies.push(Body::new(
@@ -311,42 +268,38 @@ fn place_body(bodies: &mut Vec<Body>, x: f64, y: f64, vx: f64, vy: f64, mode: Pl
 }
 
 // ============================================================
-// PHYSICS — SoA parallel gravity with rayon
+// PHYSICS — single-threaded (wasm compatible)
 // ============================================================
-fn compute_accelerations(pa: &PhysicsArrays) -> Vec<(f64, f64)> {
-    let len = pa.x.len();
-    let px = &pa.x;
-    let py = &pa.y;
-    let pm = &pa.mass;
-
-    (0..len)
-        .into_par_iter()
-        .map(|i| {
-            let xi = px[i];
-            let yi = py[i];
-            let mut ax = 0.0f64;
-            let mut ay = 0.0f64;
-            for j in 0..len {
-                if i == j { continue; }
-                let dx = px[j] - xi;
-                let dy = py[j] - yi;
-                let dist_sq = dx * dx + dy * dy + SOFTENING_SQ;
-                let inv_dist = 1.0 / dist_sq.sqrt();
-                let accel = G * pm[j] * inv_dist * inv_dist * inv_dist; // G*m / dist^2 * (1/dist) factored
-                ax += accel * dx;
-                ay += accel * dy;
-            }
-            (ax, ay)
-        })
-        .collect()
+fn compute_accelerations(bodies: &[Body]) -> Vec<(f64, f64)> {
+    let len = bodies.len();
+    let mut accs = vec![(0.0f64, 0.0f64); len];
+    for i in 0..len {
+        if !bodies[i].alive { continue; }
+        let xi = bodies[i].x;
+        let yi = bodies[i].y;
+        for j in (i + 1)..len {
+            if !bodies[j].alive { continue; }
+            let dx = bodies[j].x - xi;
+            let dy = bodies[j].y - yi;
+            let dist_sq = dx * dx + dy * dy + SOFTENING_SQ;
+            let inv_dist = 1.0 / dist_sq.sqrt();
+            let inv_dist3 = inv_dist * inv_dist * inv_dist;
+            // Acceleration on i from j
+            let ai = G * bodies[j].mass * inv_dist3;
+            accs[i].0 += ai * dx;
+            accs[i].1 += ai * dy;
+            // Acceleration on j from i (Newton's 3rd law — half the work)
+            let aj = G * bodies[i].mass * inv_dist3;
+            accs[j].0 -= aj * dx;
+            accs[j].1 -= aj * dy;
+        }
+    }
+    accs
 }
 
 fn step_physics(bodies: &mut Vec<Body>, dt: f64) {
-    // Extract SoA for cache-friendly gravity
-    let pa = PhysicsArrays::from_bodies(bodies);
-    let accs = compute_accelerations(&pa);
+    let accs = compute_accelerations(bodies);
 
-    // Integrate + trails
     for (i, &(ax, ay)) in accs.iter().enumerate() {
         if !bodies[i].alive { continue; }
         bodies[i].vx += ax * dt;
@@ -357,11 +310,11 @@ fn step_physics(bodies: &mut Vec<Body>, dt: f64) {
         let pos = (bodies[i].x, bodies[i].y);
         bodies[i].trail.push_back(pos);
         if bodies[i].trail.len() > TRAIL_MAX {
-            bodies[i].trail.pop_front(); // O(1) with VecDeque
+            bodies[i].trail.pop_front();
         }
     }
 
-    // Merge collisions (sequential — order matters)
+    // Merge collisions
     let len = bodies.len();
     for i in 0..len {
         if !bodies[i].alive { continue; }
@@ -399,7 +352,6 @@ fn step_physics(bodies: &mut Vec<Body>, dt: f64) {
             }
         }
     }
-
     bodies.retain(|b| b.alive);
 }
 
@@ -417,7 +369,54 @@ fn center_of_mass(bodies: &[Body]) -> (f64, f64) {
     (tx / tm, ty / tm)
 }
 
-// Orbit predictions are computed on a background thread (see main loop)
+// ============================================================
+// PROJECTED ORBITS
+// ============================================================
+fn compute_orbit_predictions(bodies: &[Body]) -> Vec<Vec<(f64, f64)>> {
+    let len = bodies.len();
+    if len < 2 { return vec![]; }
+
+    let mut sx: Vec<f64> = bodies.iter().map(|b| b.x).collect();
+    let mut sy: Vec<f64> = bodies.iter().map(|b| b.y).collect();
+    let mut svx: Vec<f64> = bodies.iter().map(|b| b.vx).collect();
+    let mut svy: Vec<f64> = bodies.iter().map(|b| b.vy).collect();
+    let sm: Vec<f64> = bodies.iter().map(|b| b.mass).collect();
+
+    let mut paths: Vec<Vec<(f64, f64)>> = (0..len)
+        .map(|i| vec![(sx[i], sy[i])])
+        .collect();
+
+    for step in 0..ORBIT_PREDICTION_STEPS {
+        // Symmetric force computation (half the work)
+        let mut ax = vec![0.0f64; len];
+        let mut ay = vec![0.0f64; len];
+        for i in 0..len {
+            for j in (i + 1)..len {
+                let dx = sx[j] - sx[i];
+                let dy = sy[j] - sy[i];
+                let dist_sq = dx * dx + dy * dy + SOFTENING_SQ;
+                let inv_dist = 1.0 / dist_sq.sqrt();
+                let inv_dist3 = inv_dist * inv_dist * inv_dist;
+                let fi = G * sm[j] * inv_dist3;
+                let fj = G * sm[i] * inv_dist3;
+                ax[i] += fi * dx;
+                ay[i] += fi * dy;
+                ax[j] -= fj * dx;
+                ay[j] -= fj * dy;
+            }
+        }
+        for i in 0..len {
+            svx[i] += ax[i];
+            svy[i] += ay[i];
+            sx[i] += svx[i];
+            sy[i] += svy[i];
+            if step % 2 == 0 {
+                paths[i].push((sx[i], sy[i]));
+            }
+        }
+    }
+    paths
+}
 
 // ============================================================
 // DRAWING HELPERS
@@ -433,14 +432,11 @@ fn world_to_screen(wx: f64, wy: f64, cam: &Camera, sw: f64, sh: f64) -> (f32, f3
 fn draw_body_at(b: &Body, cam: &Camera, sw: f64, sh: f64) {
     let (sx, sy) = world_to_screen(b.x, b.y, cam, sw, sh);
     let r = (b.radius * cam.zoom) as f32;
-
-    // Frustum cull with generous margin for glow
     let margin = r * 3.5;
     if sx < -margin || sx > sw as f32 + margin || sy < -margin || sy > sh as f32 + margin {
         return;
     }
 
-    // Glow
     match b.body_type {
         BodyType::Star => {
             draw_circle(sx, sy, r * 3.0, Color::new(1.0, 0.86, 0.47, 0.12));
@@ -452,7 +448,6 @@ fn draw_body_at(b: &Body, cam: &Camera, sw: f64, sh: f64) {
         _ => {}
     }
 
-    // Body
     if b.body_type == BodyType::Star {
         draw_circle(sx, sy, r, Color::new(1.0, 0.95, 0.85, 1.0));
         draw_circle(sx, sy, r * 0.7, Color::new(1.0, 0.90, 0.55, 1.0));
@@ -460,7 +455,6 @@ fn draw_body_at(b: &Body, cam: &Camera, sw: f64, sh: f64) {
         draw_circle(sx, sy, r.max(1.0), b.fill);
     }
 
-    // Specular
     if r > 3.0 {
         draw_circle(sx - r * 0.25, sy - r * 0.25, r * 0.2, Color::new(1.0, 1.0, 1.0, 0.15));
     }
@@ -478,14 +472,10 @@ fn draw_trail(b: &Body, cam: &Camera, sw: f64, sh: f64) {
         let t = i as f32 / tlen as f32;
         let (x1, y1) = world_to_screen(b.trail[i - 1].0, b.trail[i - 1].1, cam, sw, sh);
         let (x2, y2) = world_to_screen(b.trail[i].0, b.trail[i].1, cam, sw, sh);
-        // Frustum cull: skip if both endpoints are off the same side
         if (x1 < 0.0 && x2 < 0.0) || (x1 > swf && x2 > swf)
             || (y1 < 0.0 && y2 < 0.0) || (y1 > shf && y2 > shf)
-        {
-            continue;
-        }
-        let alpha = t * max_alpha;
-        draw_line(x1, y1, x2, y2, thickness, Color::new(b.glow.r, b.glow.g, b.glow.b, alpha));
+        { continue; }
+        draw_line(x1, y1, x2, y2, thickness, Color::new(b.glow.r, b.glow.g, b.glow.b, t * max_alpha));
     }
 }
 
@@ -493,20 +483,16 @@ fn draw_orbit_predictions(bodies: &[Body], paths: &[Vec<(f64, f64)>], cam: &Came
     let swf = sw as f32;
     let shf = sh as f32;
     for (i, path) in paths.iter().enumerate() {
-        if path.len() < 2 { continue; }
+        if i >= bodies.len() || path.len() < 2 { continue; }
         let b = &bodies[i];
         let alpha = if b.body_type == BodyType::Asteroid { 0.04 } else { 0.12 };
-
         for j in 1..path.len() {
-            if j % 3 == 0 { continue; } // dashed effect
+            if j % 3 == 0 { continue; }
             let (x1, y1) = world_to_screen(path[j - 1].0, path[j - 1].1, cam, sw, sh);
             let (x2, y2) = world_to_screen(path[j].0, path[j].1, cam, sw, sh);
-            // Frustum cull
             if (x1 < 0.0 && x2 < 0.0) || (x1 > swf && x2 > swf)
                 || (y1 < 0.0 && y2 < 0.0) || (y1 > shf && y2 > shf)
-            {
-                continue;
-            }
+            { continue; }
             draw_line(x1, y1, x2, y2, 1.0, Color::new(b.glow.r, b.glow.g, b.glow.b, alpha));
         }
     }
@@ -514,7 +500,7 @@ fn draw_orbit_predictions(bodies: &[Body], paths: &[Vec<(f64, f64)>], cam: &Came
 
 fn draw_drag_preview(
     start: (f64, f64), mouse: (f64, f64),
-    mode: PlaceMode, pa: &PhysicsArrays,
+    mode: PlaceMode, bodies: &[Body],
     cam: &Camera, sw: f64, sh: f64,
 ) {
     let (sx, sy) = world_to_screen(start.0, start.1, cam, sw, sh);
@@ -529,21 +515,19 @@ fn draw_drag_preview(
         let (ex, ey) = world_to_screen(start.0 + dx, start.1 + dy, cam, sw, sh);
         draw_line(sx, sy, ex, ey, 1.0, Color::new(1.0, 1.0, 1.0, 0.15));
 
-        // Predict orbit of launched body using SoA data
         let mut px = start.0;
         let mut py = start.1;
         let mut pvx = dx * 0.05;
         let mut pvy = dy * 0.05;
         let mut prev = world_to_screen(px, py, cam, sw, sh);
-        let body_count = pa.x.len();
 
         for step in 0..400 {
-            for k in 0..body_count {
-                let bx = pa.x[k] - px;
-                let by = pa.y[k] - py;
+            for b in bodies {
+                let bx = b.x - px;
+                let by = b.y - py;
                 let ds = bx * bx + by * by + SOFTENING_SQ;
                 let inv_d = 1.0 / ds.sqrt();
-                let accel = G * pa.mass[k] * inv_d * inv_d * inv_d;
+                let accel = G * b.mass * inv_d * inv_d * inv_d;
                 pvx += accel * bx;
                 pvy += accel * by;
             }
@@ -611,94 +595,17 @@ async fn main() {
 
     let mut dragging = false;
     let mut drag_start = (0.0f64, 0.0f64);
-    let mut panning = false;
-    let mut pan_last = (0.0f32, 0.0f32);
 
     let mut orbit_paths: Vec<Vec<(f64, f64)>> = vec![];
-    let mut orbit_body_count: usize = 0; // track how many bodies the predictions are for
+    let mut orbit_body_count: usize = 0;
     let mut orbit_timer = 0.0;
-
-    // Background orbit prediction thread
-    let orbit_result: Arc<Mutex<Option<(Vec<Vec<(f64, f64)>>, usize)>>> = Arc::new(Mutex::new(None));
-    let orbit_result_reader = Arc::clone(&orbit_result);
-    let (orbit_tx, orbit_rx) = mpsc::channel::<Vec<(f64, f64, f64, f64, f64)>>();
-    let orbit_computing = Arc::new(Mutex::new(false));
-    let orbit_computing_check = Arc::clone(&orbit_computing);
-
-    std::thread::spawn(move || {
-        while let Ok(snapshot) = orbit_rx.recv() {
-            let len = snapshot.len();
-            if len < 2 {
-                let mut result = orbit_result.lock().unwrap();
-                *result = Some((vec![], len));
-                *orbit_computing.lock().unwrap() = false;
-                continue;
-            }
-
-            // SoA for prediction
-            let mut sx: Vec<f64> = snapshot.iter().map(|s| s.0).collect();
-            let mut sy: Vec<f64> = snapshot.iter().map(|s| s.1).collect();
-            let mut svx: Vec<f64> = snapshot.iter().map(|s| s.2).collect();
-            let mut svy: Vec<f64> = snapshot.iter().map(|s| s.3).collect();
-            let sm: Vec<f64> = snapshot.iter().map(|s| s.4).collect();
-
-            let points_per_body = ORBIT_PREDICTION_STEPS / 2 + 1;
-            let mut paths: Vec<Vec<(f64, f64)>> = (0..len)
-                .map(|i| {
-                    let mut v = Vec::with_capacity(points_per_body);
-                    v.push((sx[i], sy[i]));
-                    v
-                })
-                .collect();
-
-            for step in 0..ORBIT_PREDICTION_STEPS {
-                let accs: Vec<(f64, f64)> = (0..len)
-                    .into_par_iter()
-                    .map(|i| {
-                        let xi = sx[i];
-                        let yi = sy[i];
-                        let mut ax = 0.0;
-                        let mut ay = 0.0;
-                        for j in 0..len {
-                            if i == j { continue; }
-                            let dx = sx[j] - xi;
-                            let dy = sy[j] - yi;
-                            let dist_sq = dx * dx + dy * dy + SOFTENING_SQ;
-                            let inv_dist = 1.0 / dist_sq.sqrt();
-                            let accel = G * sm[j] * inv_dist * inv_dist * inv_dist;
-                            ax += accel * dx;
-                            ay += accel * dy;
-                        }
-                        (ax, ay)
-                    })
-                    .collect();
-
-                for i in 0..len {
-                    svx[i] += accs[i].0;
-                    svy[i] += accs[i].1;
-                    sx[i] += svx[i];
-                    sy[i] += svy[i];
-                    if step % 2 == 0 {
-                        paths[i].push((sx[i], sy[i]));
-                    }
-                }
-            }
-
-            let mut result = orbit_result.lock().unwrap();
-            *result = Some((paths, len));
-            *orbit_computing.lock().unwrap() = false;
-        }
-    });
 
     let mut prev_sw = screen_width();
     let mut prev_sh = screen_height();
 
-    // FPS tracking
     let mut fps_accum = 0.0;
     let mut fps_frames = 0u32;
     let mut fps_display = 0u32;
-
-    set_mouse_cursor(CursorIcon::Crosshair);
 
     loop {
         let raw_dt = get_frame_time() as f64;
@@ -706,7 +613,6 @@ async fn main() {
         let sw = screen_width() as f64;
         let sh = screen_height() as f64;
 
-        // FPS counter
         fps_accum += raw_dt;
         fps_frames += 1;
         if fps_accum >= 0.5 {
@@ -715,7 +621,6 @@ async fn main() {
             fps_frames = 0;
         }
 
-        // Regenerate stars on resize
         if (screen_width() - prev_sw).abs() > 1.0 || (screen_height() - prev_sh).abs() > 1.0 {
             stars = make_starfield(screen_width(), screen_height());
             prev_sw = screen_width();
@@ -764,11 +669,20 @@ async fn main() {
             flash.show("NEW SYSTEM");
         }
 
-        // Scroll = zoom
-        let (_wheel_x, wheel_y) = mouse_wheel();
-        if wheel_y != 0.0 {
-            let zoom_delta = wheel_y * 0.03;
-            cam.zoom_target = (cam.zoom_target * (1.0 + zoom_delta as f64)).clamp(0.15, 8.0);
+        // Scroll: pinch (ctrl+wheel in browser) = zoom, plain scroll = pan
+        let (wheel_x, wheel_y) = mouse_wheel();
+        if wheel_x != 0.0 || wheel_y != 0.0 {
+            if is_key_down(KeyCode::LeftControl) || is_key_down(KeyCode::RightControl)
+                || is_key_down(KeyCode::LeftSuper) || is_key_down(KeyCode::RightSuper)
+            {
+                let zoom_delta = wheel_y * 0.01;
+                cam.zoom_target = (cam.zoom_target * (1.0 + zoom_delta as f64)).clamp(0.15, 8.0);
+            } else {
+                // Mac natural scrolling: content follows finger direction
+                cam.manual_offset = true;
+                cam.offset_x -= wheel_x as f64 / cam.zoom;
+                cam.offset_y -= wheel_y as f64 / cam.zoom;
+            }
         }
 
         // +/- keys for zoom
@@ -779,25 +693,8 @@ async fn main() {
             cam.zoom_target = (cam.zoom_target / 1.3).max(0.15);
         }
 
-        // Right-click drag = pan
+        // Mouse drag to place/launch
         let (mx, my) = mouse_position();
-        if is_mouse_button_pressed(MouseButton::Right) {
-            panning = true;
-            pan_last = (mx, my);
-        }
-        if panning && is_mouse_button_down(MouseButton::Right) {
-            let dx = (mx - pan_last.0) as f64 / cam.zoom;
-            let dy = (my - pan_last.1) as f64 / cam.zoom;
-            cam.manual_offset = true;
-            cam.offset_x -= dx;
-            cam.offset_y -= dy;
-            pan_last = (mx, my);
-        }
-        if is_mouse_button_released(MouseButton::Right) {
-            panning = false;
-        }
-
-        // Left-click drag = place/launch body
         if is_mouse_button_pressed(MouseButton::Left) {
             dragging = true;
             drag_start = cam.screen_to_world(mx as f64, my as f64, sw, sh);
@@ -831,47 +728,26 @@ async fn main() {
         }
         cam.update();
 
-        // ---- ORBIT PREDICTIONS (background thread, non-blocking) ----
-        // Pick up results if ready
-        {
-            let mut result = orbit_result_reader.lock().unwrap();
-            if let Some((paths, count)) = result.take() {
-                orbit_paths = paths;
-                orbit_body_count = count;
-            }
-        }
-
-        // Submit new prediction job if timer expired and worker is idle
+        // ---- ORBIT PREDICTIONS ----
         orbit_timer -= dt_capped;
         if orbit_timer <= 0.0 && show_orbits && bodies.len() >= 2 {
-            let is_computing = *orbit_computing_check.lock().unwrap();
-            if !is_computing {
-                *orbit_computing_check.lock().unwrap() = true;
-                let snapshot: Vec<(f64, f64, f64, f64, f64)> = bodies
-                    .iter()
-                    .map(|b| (b.x, b.y, b.vx, b.vy, b.mass))
-                    .collect();
-                let _ = orbit_tx.send(snapshot);
-                orbit_timer = 0.15;
-            }
+            orbit_paths = compute_orbit_predictions(&bodies);
+            orbit_body_count = bodies.len();
+            orbit_timer = 0.2;
         }
 
         // ---- RENDER ----
         clear_background(Color::new(0.02, 0.02, 0.03, 1.0));
         draw_starfield(&stars);
 
-        if show_grid {
-            draw_grid(&cam, sw, sh);
-        }
+        if show_grid { draw_grid(&cam, sw, sh); }
 
         if show_orbits && orbit_body_count == bodies.len() && !orbit_paths.is_empty() {
             draw_orbit_predictions(&bodies, &orbit_paths, &cam, sw, sh);
         }
 
         if show_trails {
-            for b in &bodies {
-                draw_trail(b, &cam, sw, sh);
-            }
+            for b in &bodies { draw_trail(b, &cam, sw, sh); }
         }
 
         let mut sorted_indices: Vec<usize> = (0..bodies.len()).collect();
@@ -882,8 +758,7 @@ async fn main() {
 
         if dragging {
             let mouse_world = cam.screen_to_world(mx as f64, my as f64, sw, sh);
-            let pa = PhysicsArrays::from_bodies(&bodies);
-            draw_drag_preview(drag_start, mouse_world, place_mode, &pa, &cam, sw, sh);
+            draw_drag_preview(drag_start, mouse_world, place_mode, &bodies, &cam, sw, sh);
         }
 
         // ---- HUD ----
@@ -905,12 +780,11 @@ async fn main() {
             16.0, help_y - 14.0, 11.0, help_color,
         );
         draw_text(
-            "scroll: zoom | +/-: zoom | right-drag: pan | [ ]: time | H: recenter | C: clear | X: explode | space: new system",
+            "pinch: zoom | scroll: pan | +/-: zoom | [ ]: time | H: recenter | C: clear | X: explode | space: new system",
             16.0, help_y, 11.0, help_color,
         );
 
         flash.draw();
-
         next_frame().await;
     }
 }
