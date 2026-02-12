@@ -1,0 +1,574 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>VOID</title>
+<style>
+*{margin:0;padding:0}
+body{background:#000;overflow:hidden;font-family:monospace;cursor:crosshair;-webkit-user-select:none;user-select:none}
+canvas{display:block}
+#hud{position:fixed;top:16px;left:16px;color:#777;font-size:11px;pointer-events:none;z-index:10;letter-spacing:2px}
+#hud h1{font-size:20px;color:#999;letter-spacing:6px;margin:0 0 2px 0}
+#hud small{color:#444;font-size:9px;letter-spacing:3px}
+#hud p{margin-top:10px;color:#555;font-size:10px;line-height:1.7}
+#help{position:fixed;bottom:16px;left:16px;color:#333;font-size:9px;letter-spacing:1px;line-height:2;pointer-events:none;z-index:10}
+#help b{color:#555;background:#111;padding:1px 4px;border-radius:2px;border:1px solid #222}
+#msg{position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);font-size:32px;letter-spacing:8px;font-weight:bold;color:#fff;pointer-events:none;z-index:20;opacity:0;transition:opacity 0.3s}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud">
+  <h1>VOID</h1>
+  <small>orbital simulator</small>
+  <p id="stats"></p>
+</div>
+<div id="help">
+  <b>click</b> place &nbsp; <b>drag</b> launch &nbsp; <b>1</b> planet &nbsp; <b>2</b> giant &nbsp; <b>3</b> star &nbsp; <b>4</b> asteroids<br>
+  <b>T</b> trails &nbsp; <b>G</b> grid &nbsp; <b>F</b> pause &nbsp; <b>C</b> clear &nbsp; <b>X</b> explode &nbsp; <b>scroll</b> speed &nbsp; <b>space</b> new system
+</div>
+<div id="msg"></div>
+
+<script>
+// ============================================================
+// SETUP
+// ============================================================
+var canvas = document.getElementById('c');
+var ctx = canvas.getContext('2d');
+var statsEl = document.getElementById('stats');
+var msgEl = document.getElementById('msg');
+var W = 0, H = 0;
+
+// Camera — smoothly tracks center of mass
+var camX = 0, camY = 0;       // current camera offset (world coords of screen center)
+var camTargX = 0, camTargY = 0; // target (center of mass)
+var camSmooth = 0.05;          // lerp factor
+
+function resize() {
+  W = canvas.width = window.innerWidth;
+  H = canvas.height = window.innerHeight;
+  makeStarfield();
+}
+window.addEventListener('resize', resize);
+resize();
+
+// Convert screen coords to world coords
+function screenToWorld(sx, sy) {
+  return { x: sx + camX - W / 2, y: sy + camY - H / 2 };
+}
+
+// Compute center of mass
+function getCenterOfMass() {
+  if (bodies.length === 0) return { x: W / 2, y: H / 2 };
+  var tx = 0, ty = 0, tm = 0;
+  for (var i = 0; i < bodies.length; i++) {
+    tx += bodies[i].x * bodies[i].mass;
+    ty += bodies[i].y * bodies[i].mass;
+    tm += bodies[i].mass;
+  }
+  return { x: tx / tm, y: ty / tm };
+}
+
+// ============================================================
+// STARFIELD (static background)
+// ============================================================
+var bgStars = [];
+function makeStarfield() {
+  bgStars = [];
+  for (var i = 0; i < 400; i++) {
+    bgStars.push({
+      x: Math.random() * W,
+      y: Math.random() * H,
+      s: Math.random() < 0.1 ? 1.2 : 0.6,
+      a: 0.1 + Math.random() * 0.4
+    });
+  }
+}
+
+function drawStarfield() {
+  for (var i = 0; i < bgStars.length; i++) {
+    var s = bgStars[i];
+    ctx.globalAlpha = s.a;
+    ctx.fillStyle = '#aabbcc';
+    ctx.fillRect(s.x, s.y, s.s, s.s);
+  }
+  ctx.globalAlpha = 1;
+}
+
+// ============================================================
+// BODIES
+// ============================================================
+var bodies = [];
+var G_CONST = 0.5;
+var SOFTENING = 10;
+
+function addBody(x, y, vx, vy, mass, radius, type) {
+  var colors = {
+    star:     { fill: '#ffdd77', glow: '#ffaa22' },
+    heavy:    { fill: '#7799bb', glow: '#4466aa' },
+    planet:   { fill: '#8899aa', glow: '#556677' },
+    asteroid: { fill: '#777',    glow: '#555' }
+  };
+  var palettes = [
+    { fill: '#8899aa', glow: '#556677' },
+    { fill: '#aa8866', glow: '#886644' },
+    { fill: '#77aa88', glow: '#558866' },
+    { fill: '#aa7777', glow: '#884444' },
+    { fill: '#9988aa', glow: '#665577' },
+    { fill: '#6699aa', glow: '#447788' },
+    { fill: '#bbaa88', glow: '#998866' }
+  ];
+  var c = colors[type] || colors.planet;
+  if (type === 'planet' || type === 'heavy') {
+    c = palettes[Math.floor(Math.random() * palettes.length)];
+  }
+
+  bodies.push({
+    x: x, y: y, vx: vx, vy: vy,
+    mass: mass, radius: radius, type: type,
+    fill: c.fill, glow: c.glow,
+    trail: [], alive: true
+  });
+}
+
+// ============================================================
+// SOLAR SYSTEM GENERATOR
+// ============================================================
+function spawnSystem(cx, cy) {
+  // Star
+  addBody(cx, cy, 0, 0, 1200, 22, 'star');
+
+  // Planets
+  var dists = [90, 140, 200, 275, 360];
+  for (var i = 0; i < dists.length; i++) {
+    var r = dists[i];
+    var a = Math.random() * Math.PI * 2;
+    var speed = Math.sqrt(G_CONST * 1200 / r);
+    var type = r > 300 ? 'heavy' : 'planet';
+    var mass = type === 'heavy' ? (120 + Math.random() * 80) : (8 + Math.random() * 15);
+    var rad = type === 'heavy' ? (8 + Math.random() * 3) : (3 + Math.random() * 3);
+    addBody(
+      cx + Math.cos(a) * r,
+      cy + Math.sin(a) * r,
+      -Math.sin(a) * speed,
+       Math.cos(a) * speed,
+      mass, rad, type
+    );
+  }
+
+  // Asteroid belt
+  for (var i = 0; i < 20; i++) {
+    var r = 410 + Math.random() * 60;
+    var a = Math.random() * Math.PI * 2;
+    var speed = Math.sqrt(G_CONST * 1200 / r) * (0.93 + Math.random() * 0.14);
+    addBody(
+      cx + Math.cos(a) * r,
+      cy + Math.sin(a) * r,
+      -Math.sin(a) * speed,
+       Math.cos(a) * speed,
+      0.5 + Math.random() * 1.5,
+      1 + Math.random() * 1,
+      'asteroid'
+    );
+  }
+}
+
+// ============================================================
+// PHYSICS
+// ============================================================
+function stepPhysics(dt) {
+  var i, j, a, b, dx, dy, distSq, dist, force, fx, fy;
+  var len = bodies.length;
+
+  // Gravity pairs
+  for (i = 0; i < len; i++) {
+    a = bodies[i];
+    if (!a.alive) continue;
+    for (j = i + 1; j < len; j++) {
+      b = bodies[j];
+      if (!b.alive) continue;
+
+      dx = b.x - a.x;
+      dy = b.y - a.y;
+      distSq = dx * dx + dy * dy + SOFTENING * SOFTENING;
+      dist = Math.sqrt(distSq);
+
+      // Collision -> merge
+      if (dist < (a.radius + b.radius) * 0.75) {
+        var big = a.mass >= b.mass ? a : b;
+        var sm  = a.mass >= b.mass ? b : a;
+        var tot = big.mass + sm.mass;
+        big.vx = (big.vx * big.mass + sm.vx * sm.mass) / tot;
+        big.vy = (big.vy * big.mass + sm.vy * sm.mass) / tot;
+        big.x = (big.x * big.mass + sm.x * sm.mass) / tot;
+        big.y = (big.y * big.mass + sm.y * sm.mass) / tot;
+        big.mass = tot;
+        big.radius = Math.pow(big.radius * big.radius * big.radius + sm.radius * sm.radius * sm.radius, 1/3);
+        if (big.mass > 400) {
+          big.type = 'star'; big.fill = '#ffdd77'; big.glow = '#ffaa22';
+        } else if (big.mass > 80) {
+          big.type = 'heavy';
+        }
+        sm.alive = false;
+        continue;
+      }
+
+      force = G_CONST * a.mass * b.mass / distSq;
+      fx = force * dx / dist;
+      fy = force * dy / dist;
+      a.vx += fx / a.mass * dt;
+      a.vy += fy / a.mass * dt;
+      b.vx -= fx / b.mass * dt;
+      b.vy -= fy / b.mass * dt;
+    }
+  }
+
+  // Integrate positions + record trails
+  for (i = 0; i < len; i++) {
+    b = bodies[i];
+    if (!b.alive) continue;
+    b.x += b.vx * dt;
+    b.y += b.vy * dt;
+    b.trail.push(b.x, b.y); // flat array: x,y,x,y,...
+    if (b.trail.length > 360) { // 180 points * 2
+      b.trail.splice(0, 2);
+    }
+  }
+
+  // Remove dead
+  var alive = [];
+  for (i = 0; i < len; i++) {
+    if (bodies[i].alive) alive.push(bodies[i]);
+  }
+  bodies = alive;
+}
+
+// ============================================================
+// DRAWING
+// ============================================================
+var showTrails = true;
+var showGrid = false;
+
+function drawTrail(b) {
+  if (!showTrails) return;
+  if (b.trail.length < 4) return;
+  ctx.beginPath();
+  ctx.moveTo(b.trail[0], b.trail[1]);
+  for (var i = 2; i < b.trail.length; i += 2) {
+    ctx.lineTo(b.trail[i], b.trail[i+1]);
+  }
+  ctx.strokeStyle = b.glow;
+  ctx.globalAlpha = b.type === 'asteroid' ? 0.1 : 0.3;
+  ctx.lineWidth = Math.max(0.5, b.radius * 0.3);
+  ctx.stroke();
+  ctx.globalAlpha = 1;
+}
+
+function drawBody(b) {
+  var x = b.x, y = b.y, r = b.radius;
+
+  // Glow for stars and big bodies
+  if (b.type === 'star') {
+    ctx.beginPath();
+    ctx.arc(x, y, r * 3, 0, 6.283);
+    var g1 = ctx.createRadialGradient(x, y, r * 0.5, x, y, r * 3);
+    g1.addColorStop(0, 'rgba(255,220,120,0.2)');
+    g1.addColorStop(0.5, 'rgba(255,180,60,0.05)');
+    g1.addColorStop(1, 'rgba(255,150,30,0)');
+    ctx.fillStyle = g1;
+    ctx.fill();
+  } else if (r > 4) {
+    ctx.beginPath();
+    ctx.arc(x, y, r * 2, 0, 6.283);
+    var g2 = ctx.createRadialGradient(x, y, r * 0.3, x, y, r * 2);
+    g2.addColorStop(0, 'rgba(100,130,170,0.08)');
+    g2.addColorStop(1, 'rgba(100,130,170,0)');
+    ctx.fillStyle = g2;
+    ctx.fill();
+  }
+
+  // Body
+  ctx.beginPath();
+  ctx.arc(x, y, r, 0, 6.283);
+  if (b.type === 'star') {
+    var sg = ctx.createRadialGradient(x - r * 0.3, y - r * 0.3, 0, x, y, r);
+    sg.addColorStop(0, '#fffef0');
+    sg.addColorStop(0.5, '#ffe888');
+    sg.addColorStop(1, '#cc9944');
+    ctx.fillStyle = sg;
+  } else {
+    ctx.fillStyle = b.fill;
+  }
+  ctx.fill();
+
+  // Specular highlight on larger bodies
+  if (r > 3) {
+    ctx.beginPath();
+    ctx.arc(x - r * 0.25, y - r * 0.25, r * 0.2, 0, 6.283);
+    ctx.fillStyle = 'rgba(255,255,255,0.15)';
+    ctx.fill();
+  }
+}
+
+function drawGrid() {
+  if (!showGrid) return;
+  ctx.strokeStyle = 'rgba(255,255,255,0.02)';
+  ctx.lineWidth = 0.5;
+  var sp = 80;
+  // Grid lines aligned to world coordinates
+  var startX = Math.floor((camX - W/2) / sp) * sp;
+  var startY = Math.floor((camY - H/2) / sp) * sp;
+  ctx.beginPath();
+  for (var x = startX; x < camX + W/2; x += sp) { ctx.moveTo(x, camY - H/2); ctx.lineTo(x, camY + H/2); }
+  for (var y = startY; y < camY + H/2; y += sp) { ctx.moveTo(camX - W/2, y); ctx.lineTo(camX + W/2, y); }
+  ctx.stroke();
+}
+
+function drawPreview() {
+  if (!dragging) return;
+  var dx = dragStartX - mouseX;
+  var dy = dragStartY - mouseY;
+  var len = Math.sqrt(dx * dx + dy * dy);
+  var wp = screenToWorld(dragStartX, dragStartY);
+
+  // Ghost circle
+  ctx.beginPath();
+  ctx.arc(wp.x, wp.y, previewRadius(), 0, 6.283);
+  ctx.strokeStyle = 'rgba(255,255,255,0.3)';
+  ctx.lineWidth = 1;
+  ctx.stroke();
+
+  // Velocity line
+  if (len > 5) {
+    ctx.beginPath();
+    ctx.moveTo(wp.x, wp.y);
+    ctx.lineTo(wp.x + dx, wp.y + dy);
+    ctx.strokeStyle = 'rgba(255,255,255,0.15)';
+    ctx.lineWidth = 1;
+    ctx.setLineDash([4, 4]);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // Orbit prediction
+    var px = wp.x, py = wp.y;
+    var pvx = dx * 0.05, pvy = dy * 0.05;
+    ctx.beginPath();
+    ctx.moveTo(px, py);
+    for (var step = 0; step < 400; step++) {
+      for (var i = 0; i < bodies.length; i++) {
+        var b = bodies[i];
+        var bx = b.x - px, by = b.y - py;
+        var ds = bx * bx + by * by + SOFTENING * SOFTENING;
+        var d = Math.sqrt(ds);
+        var f = G_CONST * b.mass / ds;
+        pvx += f * bx / d;
+        pvy += f * by / d;
+      }
+      px += pvx;
+      py += pvy;
+      ctx.lineTo(px, py);
+    }
+    ctx.strokeStyle = 'rgba(80,130,220,0.08)';
+    ctx.lineWidth = 1;
+    ctx.setLineDash([2, 6]);
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+}
+
+function previewRadius() {
+  if (placeMode === 'star') return 18;
+  if (placeMode === 'heavy') return 9;
+  if (placeMode === 'asteroids') return 2;
+  return 5;
+}
+
+// ============================================================
+// INPUT
+// ============================================================
+var mouseX = 0, mouseY = 0;
+var dragging = false;
+var dragStartX = 0, dragStartY = 0;
+var placeMode = 'planet';
+var paused = false;
+var timeScale = 1;
+var msgTimer = null;
+
+canvas.addEventListener('mousemove', function(e) { mouseX = e.clientX; mouseY = e.clientY; });
+canvas.addEventListener('mousedown', function(e) {
+  if (e.button === 0) { dragging = true; dragStartX = e.clientX; dragStartY = e.clientY; }
+});
+canvas.addEventListener('mouseup', function(e) {
+  if (e.button !== 0 || !dragging) return;
+  dragging = false;
+  var dx = dragStartX - mouseX;
+  var dy = dragStartY - mouseY;
+  var vx = dx * 0.05, vy = dy * 0.05;
+  var wp = screenToWorld(dragStartX, dragStartY);
+  placeBody(wp.x, wp.y, vx, vy);
+});
+canvas.addEventListener('contextmenu', function(e) { e.preventDefault(); });
+canvas.addEventListener('wheel', function(e) {
+  timeScale = Math.max(0.1, Math.min(5, timeScale + (e.deltaY > 0 ? -0.15 : 0.15)));
+});
+
+// Touch
+canvas.addEventListener('touchstart', function(e) {
+  e.preventDefault();
+  dragging = true;
+  dragStartX = e.touches[0].clientX;
+  dragStartY = e.touches[0].clientY;
+  mouseX = dragStartX; mouseY = dragStartY;
+}, {passive: false});
+canvas.addEventListener('touchmove', function(e) {
+  e.preventDefault();
+  mouseX = e.touches[0].clientX;
+  mouseY = e.touches[0].clientY;
+}, {passive: false});
+canvas.addEventListener('touchend', function(e) {
+  if (!dragging) return;
+  dragging = false;
+  var dx = dragStartX - mouseX, dy = dragStartY - mouseY;
+  var wp = screenToWorld(dragStartX, dragStartY);
+  placeBody(wp.x, wp.y, dx * 0.05, dy * 0.05);
+}, {passive: false});
+
+function placeBody(x, y, vx, vy) {
+  if (placeMode === 'star') {
+    addBody(x, y, vx, vy, 600 + Math.random() * 400, 16 + Math.random() * 6, 'star');
+  } else if (placeMode === 'heavy') {
+    addBody(x, y, vx, vy, 100 + Math.random() * 100, 7 + Math.random() * 4, 'heavy');
+  } else if (placeMode === 'asteroids') {
+    for (var i = 0; i < 15; i++) {
+      addBody(
+        x + (Math.random() - 0.5) * 50,
+        y + (Math.random() - 0.5) * 50,
+        vx + (Math.random() - 0.5) * 0.4,
+        vy + (Math.random() - 0.5) * 0.4,
+        0.5 + Math.random(), 1 + Math.random(), 'asteroid'
+      );
+    }
+  } else {
+    addBody(x, y, vx, vy, 8 + Math.random() * 15, 3 + Math.random() * 3, 'planet');
+  }
+}
+
+function showMsg(text) {
+  msgEl.textContent = text;
+  msgEl.style.opacity = '1';
+  if (msgTimer) clearTimeout(msgTimer);
+  msgTimer = setTimeout(function() { msgEl.style.opacity = '0'; }, 600);
+}
+
+window.addEventListener('keydown', function(e) {
+  var k = e.key.toLowerCase();
+  if (k === '1') { placeMode = 'planet'; showMsg('PLANET'); }
+  if (k === '2') { placeMode = 'heavy'; showMsg('GIANT'); }
+  if (k === '3') { placeMode = 'star'; showMsg('STAR'); }
+  if (k === '4') { placeMode = 'asteroids'; showMsg('ASTEROIDS'); }
+  if (k === 't') { showTrails = !showTrails; showMsg(showTrails ? 'TRAILS ON' : 'TRAILS OFF'); }
+  if (k === 'g') { showGrid = !showGrid; showMsg(showGrid ? 'GRID ON' : 'GRID OFF'); }
+  if (k === 'f') { paused = !paused; showMsg(paused ? 'PAUSED' : 'RUNNING'); }
+  if (k === 'c') { bodies = []; showMsg('CLEARED'); }
+  if (k === 'x') {
+    var com = getCenterOfMass();
+    for (var i = 0; i < bodies.length; i++) {
+      var b = bodies[i], dx = b.x - com.x, dy = b.y - com.y;
+      var d = Math.sqrt(dx*dx + dy*dy) || 1;
+      b.vx += dx/d * 10; b.vy += dy/d * 10;
+    }
+    showMsg('BOOM');
+  }
+  if (k === ' ') {
+    e.preventDefault();
+    // Spawn at current center of mass, or screen center if empty
+    var sc = bodies.length > 0 ? getCenterOfMass() : { x: camX, y: camY };
+    spawnSystem(sc.x, sc.y);
+    showMsg('NEW SYSTEM');
+  }
+});
+
+// ============================================================
+// MAIN LOOP
+// ============================================================
+var lastTime = -1;
+
+function loop(now) {
+  requestAnimationFrame(loop);
+
+  // Timing
+  if (lastTime < 0) { lastTime = now; return; }
+  var elapsed = (now - lastTime) / 1000;
+  lastTime = now;
+  if (elapsed > 0.05) elapsed = 0.05;
+  var dt = elapsed * 60 * timeScale;
+
+  // Physics
+  if (!paused && dt > 0) {
+    var steps = Math.ceil(dt / 1.5);
+    if (steps < 1) steps = 1;
+    if (steps > 8) steps = 8;
+    var subDt = dt / steps;
+    for (var s = 0; s < steps; s++) {
+      stepPhysics(subDt);
+    }
+  }
+
+  // --- CAMERA: track center of mass ---
+  var com = getCenterOfMass();
+  camTargX = com.x;
+  camTargY = com.y;
+  camX += (camTargX - camX) * camSmooth;
+  camY += (camTargY - camY) * camSmooth;
+
+  // ---- RENDER ----
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = '#050508';
+  ctx.fillRect(0, 0, W, H);
+
+  // Background stars — drawn in screen space (don't move with camera)
+  drawStarfield();
+
+  // Everything else in world space
+  ctx.save();
+  ctx.translate(W / 2 - camX, H / 2 - camY);
+
+  // Grid
+  drawGrid();
+
+  // Trails
+  for (var i = 0; i < bodies.length; i++) {
+    drawTrail(bodies[i]);
+  }
+
+  // Bodies (draw stars last so they're on top)
+  var sortedBodies = bodies.slice().sort(function(a, b) { return a.mass - b.mass; });
+  for (var i = 0; i < sortedBodies.length; i++) {
+    drawBody(sortedBodies[i]);
+  }
+
+  // Drag preview
+  drawPreview();
+
+  ctx.restore();
+
+  // --- HUD (screen space) ---
+  var totalMass = 0;
+  for (var i = 0; i < bodies.length; i++) totalMass += bodies[i].mass;
+  statsEl.textContent = bodies.length + ' bodies \u00B7 ' + Math.round(totalMass) + ' mass \u00B7 ' + timeScale.toFixed(1) + 'x \u00B7 ' + placeMode;
+}
+
+// ============================================================
+// INIT
+// ============================================================
+// Initial spawn at center of screen — camera starts here
+camX = W / 2;
+camY = H / 2;
+camTargX = camX;
+camTargY = camY;
+spawnSystem(W / 2, H / 2);
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
