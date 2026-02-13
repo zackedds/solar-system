@@ -737,11 +737,11 @@ fn layout_buttons(
     show_trails: bool, show_orbits: bool, show_grid: bool, paused: bool,
     realistic_collisions: bool,
 ) -> Vec<BtnRect> {
-    let btn_h = 36.0f32;
-    let gap = 5.0f32;
+    let btn_h = 54.0f32;
+    let gap = 6.0f32;
     let margin = 10.0f32;
-    let pad_x = 12.0f32;
-    let font_size = 15u16;
+    let pad_x = 18.0f32;
+    let font_size = 23u16;
 
     let rows: [&[(&str, BtnAction, bool)]; 3] = [
         &[
@@ -786,7 +786,7 @@ fn layout_buttons(
 }
 
 fn draw_buttons(buttons: &[BtnRect]) {
-    let font_size = 15.0f32;
+    let font_size = 23.0f32;
     for btn in buttons {
         let bg_alpha = if btn.active { 0.22 } else { 0.08 };
         draw_rectangle(btn.x, btn.y, btn.w, btn.h, Color::new(1.0, 1.0, 1.0, bg_alpha));
@@ -1059,14 +1059,14 @@ async fn main() {
 
         // ---- HUD ----
         let total_mass: f64 = bodies.iter().map(|b| b.mass).sum();
-        draw_text("VOID", 16.0, 38.0, 32.0, Color::new(1.0, 1.0, 1.0, 1.0));
-        draw_text("orbital simulator", 16.0, 58.0, 16.0, Color::new(0.8, 0.8, 0.85, 1.0));
+        draw_text("VOID", 16.0, 52.0, 48.0, Color::new(1.0, 1.0, 1.0, 1.0));
+        draw_text("orbital simulator", 16.0, 80.0, 24.0, Color::new(0.8, 0.8, 0.85, 1.0));
 
         let stats = format!(
             "{} bodies  |  {} mass  |  {:.1}x  |  {}%  |  {} fps",
             bodies.len(), total_mass as i64, time_scale, (cam.zoom * 100.0) as i32, fps_display
         );
-        draw_text(&stats, 16.0, 82.0, 18.0, Color::new(0.95, 0.95, 1.0, 1.0));
+        draw_text(&stats, 16.0, 108.0, 27.0, Color::new(0.95, 0.95, 1.0, 1.0));
 
         draw_buttons(&buttons);
 
