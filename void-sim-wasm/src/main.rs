@@ -115,6 +115,7 @@ enum BtnAction {
     ToggleTrails, ToggleOrbits, ToggleGrid, TogglePause, ToggleCollisions,
     Recenter, Clear, Explode, NewSystem,
     TimeSlower, TimeFaster,
+    ToggleAdvanced, ToggleAutoSpawn,
 }
 
 struct BtnRect {
@@ -734,8 +735,7 @@ fn draw_grid(cam: &Camera, sw: f64, sh: f64) {
 // ============================================================
 fn layout_buttons(
     sw: f32, sh: f32, place_mode: PlaceMode,
-    show_trails: bool, show_orbits: bool, show_grid: bool, paused: bool,
-    realistic_collisions: bool,
+    paused: bool, realistic_collisions: bool,
 ) -> Vec<BtnRect> {
     let btn_h = 54.0f32;
     let gap = 6.0f32;
@@ -752,19 +752,15 @@ fn layout_buttons(
             ("SOLAR SYS", BtnAction::SetSolarSystem, place_mode == PlaceMode::SolarSystem),
         ],
         &[
-            ("TRAILS", BtnAction::ToggleTrails, show_trails),
-            ("ORBITS", BtnAction::ToggleOrbits, show_orbits),
-            ("GRID", BtnAction::ToggleGrid, show_grid),
             ("COLLISIONS", BtnAction::ToggleCollisions, realistic_collisions),
             ("PAUSE", BtnAction::TogglePause, paused),
             ("SLOWER", BtnAction::TimeSlower, false),
             ("FASTER", BtnAction::TimeFaster, false),
         ],
         &[
-            ("CENTER", BtnAction::Recenter, false),
             ("CLEAR", BtnAction::Clear, false),
-            ("EXPLODE", BtnAction::Explode, false),
             ("NEW SYS", BtnAction::NewSystem, false),
+            ("ADVANCED", BtnAction::ToggleAdvanced, false),
         ],
     ];
 
@@ -855,6 +851,9 @@ async fn main() {
     let mut fps_frames = 0u32;
     let mut fps_display = 0u32;
 
+    let mut advanced_open = false;
+    let mut auto_spawn = true;
+
     loop {
         let raw_dt = get_frame_time() as f64;
         let dt_capped = raw_dt.min(0.033);
@@ -879,8 +878,7 @@ async fn main() {
 
         let buttons = layout_buttons(
             screen_width(), screen_height(), place_mode,
-            show_trails, show_orbits, show_grid, paused,
-            realistic_collisions,
+            paused, realistic_collisions,
         );
 
         // ---- INPUT ----
@@ -895,7 +893,16 @@ async fn main() {
         if is_key_pressed(KeyCode::K) { realistic_collisions = !realistic_collisions; flash.show(if realistic_collisions { "COLLISIONS ON" } else { "COLLISIONS OFF" }); }
         if is_key_pressed(KeyCode::F) { paused = !paused; flash.show(if paused { "PAUSED" } else { "RUNNING" }); }
         if is_key_pressed(KeyCode::H) { cam.recenter(); flash.show("CENTERED"); }
-        if is_key_pressed(KeyCode::C) { bodies.clear(); flash.show("CLEARED"); }
+        if is_key_pressed(KeyCode::C) {
+            bodies.clear();
+            if auto_spawn {
+                spawn_system(&mut bodies, cam.x, cam.y, 0.0, 0.0);
+                cam.recenter();
+                flash.show("RESET");
+            } else {
+                flash.show("CLEARED");
+            }
+        }
 
         if is_key_pressed(KeyCode::LeftBracket) {
             time_scale = (time_scale / 1.5).max(0.1);
@@ -950,7 +957,72 @@ async fn main() {
 
         // Mouse / touch: check buttons first, then drag-to-place
         let (mx, my) = mouse_position();
+
+        // Compute advanced pop-out button rects
+        let adv_btns: Vec<BtnRect> = if advanced_open {
+            let adv_btn = buttons.iter().find(|b| b.action == BtnAction::ToggleAdvanced);
+            if let Some(ab) = adv_btn {
+                let items: [(&str, BtnAction, bool); 6] = [
+                    ("TRAILS", BtnAction::ToggleTrails, show_trails),
+                    ("ORBITS", BtnAction::ToggleOrbits, show_orbits),
+                    ("GRID", BtnAction::ToggleGrid, show_grid),
+                    ("CENTER", BtnAction::Recenter, false),
+                    ("AUTO SPAWN", BtnAction::ToggleAutoSpawn, auto_spawn),
+                    ("EXPLODE", BtnAction::Explode, false),
+                ];
+                let pbtn_h = 42.0f32;
+                let pbtn_gap = 4.0f32;
+                let pbtn_w = 130.0f32;
+                let panel_h = items.len() as f32 * (pbtn_h + pbtn_gap) + pbtn_gap;
+                let panel_x = ab.x;
+                let panel_y = ab.y - panel_h - 6.0;
+                items.iter().enumerate().map(|(i, &(label, action, active))| {
+                    BtnRect {
+                        x: panel_x + pbtn_gap,
+                        y: panel_y + pbtn_gap + i as f32 * (pbtn_h + pbtn_gap),
+                        w: pbtn_w - pbtn_gap * 2.0,
+                        h: pbtn_h,
+                        action,
+                        label,
+                        active,
+                    }
+                }).collect()
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+
         if is_mouse_button_pressed(MouseButton::Left) {
+            // Check advanced pop-out buttons first
+            let mut handled = false;
+            if advanced_open {
+                if let Some(action) = check_button_hit(&adv_btns, mx, my) {
+                    handled = true;
+                    match action {
+                        BtnAction::ToggleTrails => { show_trails = !show_trails; flash.show(if show_trails { "TRAILS ON" } else { "TRAILS OFF" }); }
+                        BtnAction::ToggleOrbits => { show_orbits = !show_orbits; flash.show(if show_orbits { "ORBITS ON" } else { "ORBITS OFF" }); }
+                        BtnAction::ToggleGrid => { show_grid = !show_grid; flash.show(if show_grid { "GRID ON" } else { "GRID OFF" }); }
+                        BtnAction::Recenter => { cam.recenter(); flash.show("CENTERED"); }
+                        BtnAction::ToggleAutoSpawn => { auto_spawn = !auto_spawn; flash.show(if auto_spawn { "AUTO SPAWN ON" } else { "AUTO SPAWN OFF" }); }
+                        BtnAction::Explode => {
+                            let (cx, cy) = center_of_mass(&bodies);
+                            for b in &mut bodies {
+                                let bx = b.x - cx;
+                                let by = b.y - cy;
+                                let d = (bx * bx + by * by).sqrt().max(1.0);
+                                b.vx += bx / d * 10.0;
+                                b.vy += by / d * 10.0;
+                            }
+                            flash.show("BOOM");
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            if !handled {
             if let Some(action) = check_button_hit(&buttons, mx, my) {
                 match action {
                     BtnAction::SetPlanet => { place_mode = PlaceMode::Planet; flash.show("PLANET"); }
@@ -958,23 +1030,19 @@ async fn main() {
                     BtnAction::SetStar => { place_mode = PlaceMode::Star; flash.show("STAR"); }
                     BtnAction::SetAsteroids => { place_mode = PlaceMode::Asteroids; flash.show("ASTEROIDS"); }
                     BtnAction::SetSolarSystem => { place_mode = PlaceMode::SolarSystem; flash.show("SOLAR SYSTEM"); }
-                    BtnAction::ToggleTrails => { show_trails = !show_trails; flash.show(if show_trails { "TRAILS ON" } else { "TRAILS OFF" }); }
-                    BtnAction::ToggleOrbits => { show_orbits = !show_orbits; flash.show(if show_orbits { "ORBITS ON" } else { "ORBITS OFF" }); }
-                    BtnAction::ToggleGrid => { show_grid = !show_grid; flash.show(if show_grid { "GRID ON" } else { "GRID OFF" }); }
                     BtnAction::ToggleCollisions => { realistic_collisions = !realistic_collisions; flash.show(if realistic_collisions { "COLLISIONS ON" } else { "COLLISIONS OFF" }); }
                     BtnAction::TogglePause => { paused = !paused; flash.show(if paused { "PAUSED" } else { "RUNNING" }); }
-                    BtnAction::Recenter => { cam.recenter(); flash.show("CENTERED"); }
-                    BtnAction::Clear => { bodies.clear(); flash.show("CLEARED"); }
-                    BtnAction::Explode => {
-                        let (cx, cy) = center_of_mass(&bodies);
-                        for b in &mut bodies {
-                            let bx = b.x - cx;
-                            let by = b.y - cy;
-                            let d = (bx * bx + by * by).sqrt().max(1.0);
-                            b.vx += bx / d * 10.0;
-                            b.vy += by / d * 10.0;
+                    BtnAction::Clear => {
+                        bodies.clear();
+                        if auto_spawn {
+                            let cx = cam.x;
+                            let cy = cam.y;
+                            spawn_system(&mut bodies, cx, cy, 0.0, 0.0);
+                            cam.recenter();
+                            flash.show("RESET");
+                        } else {
+                            flash.show("CLEARED");
                         }
-                        flash.show("BOOM");
                     }
                     BtnAction::NewSystem => {
                         let (cx, cy) = if bodies.is_empty() { (cam.x, cam.y) } else { center_of_mass(&bodies) };
@@ -989,11 +1057,21 @@ async fn main() {
                         time_scale = (time_scale * 1.5).min(10.0);
                         flash.show(&format!("{:.1}X", time_scale));
                     }
+                    BtnAction::ToggleAdvanced => {
+                        advanced_open = !advanced_open;
+                    }
+                    _ => {}
                 }
             } else {
-                dragging = true;
-                drag_start = cam.screen_to_world(mx as f64, my as f64, sw, sh);
+                // Click outside all buttons — close pop-out or start drag
+                if advanced_open {
+                    advanced_open = false;
+                } else {
+                    dragging = true;
+                    drag_start = cam.screen_to_world(mx as f64, my as f64, sw, sh);
+                }
             }
+            } // end if !handled
         }
         if is_mouse_button_released(MouseButton::Left) && dragging {
             dragging = false;
@@ -1069,6 +1147,30 @@ async fn main() {
         draw_text(&stats, 16.0, 108.0, 27.0, Color::new(0.95, 0.95, 1.0, 1.0));
 
         draw_buttons(&buttons);
+
+        // ---- ADVANCED POP-OUT ----
+        if advanced_open && !adv_btns.is_empty() {
+            let first = &adv_btns[0];
+            let last = &adv_btns[adv_btns.len() - 1];
+            let panel_x = first.x - 6.0;
+            let panel_y = first.y - 6.0;
+            let panel_w = first.w + 12.0;
+            let panel_h = (last.y + last.h) - first.y + 12.0;
+            draw_rectangle(panel_x, panel_y, panel_w, panel_h, Color::new(0.06, 0.06, 0.08, 0.94));
+            draw_rectangle_lines(panel_x, panel_y, panel_w, panel_h, 1.0, Color::new(1.0, 1.0, 1.0, 0.18));
+
+            let font_size = 20.0f32;
+            for btn in &adv_btns {
+                let bg_alpha = if btn.active { 0.22 } else { 0.08 };
+                draw_rectangle(btn.x, btn.y, btn.w, btn.h, Color::new(1.0, 1.0, 1.0, bg_alpha));
+                draw_rectangle_lines(btn.x, btn.y, btn.w, btn.h, 1.0, Color::new(1.0, 1.0, 1.0, 0.12));
+                let dims = measure_text(btn.label, None, font_size as u16, 1.0);
+                let tx = btn.x + (btn.w - dims.width) / 2.0;
+                let ty = btn.y + (btn.h + dims.height) / 2.0 - 2.0;
+                let text_alpha = if btn.active { 1.0 } else { 0.85 };
+                draw_text(btn.label, tx, ty, font_size, Color::new(1.0, 1.0, 1.0, text_alpha));
+            }
+        }
 
         flash.draw();
         next_frame().await;
