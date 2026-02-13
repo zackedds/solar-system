@@ -112,7 +112,7 @@ impl PlaceMode {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum BtnAction {
     SetPlanet, SetHeavy, SetStar, SetAsteroids, SetSolarSystem,
-    ToggleTrails, ToggleOrbits, ToggleGrid, TogglePause,
+    ToggleTrails, ToggleOrbits, ToggleGrid, TogglePause, ToggleCollisions,
     Recenter, Clear, Explode, NewSystem,
     TimeSlower, TimeFaster,
 }
@@ -318,7 +318,7 @@ fn compute_accelerations(bodies: &[Body]) -> Vec<(f64, f64)> {
     accs
 }
 
-fn step_physics(bodies: &mut Vec<Body>, dt: f64) {
+fn step_physics(bodies: &mut Vec<Body>, dt: f64, realistic_collisions: bool) {
     let accs = compute_accelerations(bodies);
 
     for (i, &(ax, ay)) in accs.iter().enumerate() {
@@ -339,7 +339,7 @@ fn step_physics(bodies: &mut Vec<Body>, dt: f64) {
         }
     }
 
-    // Realistic collisions — skip bodies still on cooldown
+    // Collisions
     let len = bodies.len();
     let mut new_bodies: Vec<Body> = Vec::new();
     for i in 0..len {
@@ -351,12 +351,27 @@ fn step_physics(bodies: &mut Vec<Body>, dt: f64) {
             let dist_sq = dx * dx + dy * dy;
             let touch_r = (bodies[i].radius + bodies[j].radius) * 0.75;
             if dist_sq < touch_r * touch_r {
-                let result = compute_collision_outcome(
-                    &bodies[i], &bodies[j], len + new_bodies.len(),
-                );
-                bodies[i].alive = false;
-                bodies[j].alive = false;
-                new_bodies.extend(result);
+                if realistic_collisions {
+                    let result = compute_collision_outcome(
+                        &bodies[i], &bodies[j], len + new_bodies.len(),
+                    );
+                    bodies[i].alive = false;
+                    bodies[j].alive = false;
+                    new_bodies.extend(result);
+                } else {
+                    // Simple merge: combine mass, conserve momentum
+                    let tm = bodies[i].mass + bodies[j].mass;
+                    let merged = make_body(
+                        tm,
+                        (bodies[i].x * bodies[i].mass + bodies[j].x * bodies[j].mass) / tm,
+                        (bodies[i].y * bodies[i].mass + bodies[j].y * bodies[j].mass) / tm,
+                        (bodies[i].vx * bodies[i].mass + bodies[j].vx * bodies[j].mass) / tm,
+                        (bodies[i].vy * bodies[i].mass + bodies[j].vy * bodies[j].mass) / tm,
+                    );
+                    bodies[i].alive = false;
+                    bodies[j].alive = false;
+                    new_bodies.push(merged);
+                }
             }
         }
     }
@@ -669,8 +684,8 @@ fn draw_drag_preview(
 
         let mut px = start.0;
         let mut py = start.1;
-        let mut pvx = dx * 0.05;
-        let mut pvy = dy * 0.05;
+        let mut pvx = dx * 0.017;
+        let mut pvy = dy * 0.017;
         let mut prev = world_to_screen(px, py, cam, sw, sh);
 
         for step in 0..400 {
@@ -720,6 +735,7 @@ fn draw_grid(cam: &Camera, sw: f64, sh: f64) {
 fn layout_buttons(
     sw: f32, sh: f32, place_mode: PlaceMode,
     show_trails: bool, show_orbits: bool, show_grid: bool, paused: bool,
+    realistic_collisions: bool,
 ) -> Vec<BtnRect> {
     let btn_h = 36.0f32;
     let gap = 5.0f32;
@@ -739,6 +755,7 @@ fn layout_buttons(
             ("TRAILS", BtnAction::ToggleTrails, show_trails),
             ("ORBITS", BtnAction::ToggleOrbits, show_orbits),
             ("GRID", BtnAction::ToggleGrid, show_grid),
+            ("COLLISIONS", BtnAction::ToggleCollisions, realistic_collisions),
             ("PAUSE", BtnAction::TogglePause, paused),
             ("SLOWER", BtnAction::TimeSlower, false),
             ("FASTER", BtnAction::TimeFaster, false),
@@ -821,6 +838,7 @@ async fn main() {
     let mut show_trails = true;
     let mut show_grid = false;
     let mut show_orbits = true;
+    let mut realistic_collisions = false;
     let mut flash = FlashMsg::new();
 
     let mut dragging = false;
@@ -862,6 +880,7 @@ async fn main() {
         let buttons = layout_buttons(
             screen_width(), screen_height(), place_mode,
             show_trails, show_orbits, show_grid, paused,
+            realistic_collisions,
         );
 
         // ---- INPUT ----
@@ -873,6 +892,7 @@ async fn main() {
         if is_key_pressed(KeyCode::T) { show_trails = !show_trails; flash.show(if show_trails { "TRAILS ON" } else { "TRAILS OFF" }); }
         if is_key_pressed(KeyCode::G) { show_grid = !show_grid; flash.show(if show_grid { "GRID ON" } else { "GRID OFF" }); }
         if is_key_pressed(KeyCode::O) { show_orbits = !show_orbits; flash.show(if show_orbits { "ORBITS ON" } else { "ORBITS OFF" }); }
+        if is_key_pressed(KeyCode::K) { realistic_collisions = !realistic_collisions; flash.show(if realistic_collisions { "COLLISIONS ON" } else { "COLLISIONS OFF" }); }
         if is_key_pressed(KeyCode::F) { paused = !paused; flash.show(if paused { "PAUSED" } else { "RUNNING" }); }
         if is_key_pressed(KeyCode::H) { cam.recenter(); flash.show("CENTERED"); }
         if is_key_pressed(KeyCode::C) { bodies.clear(); flash.show("CLEARED"); }
@@ -941,6 +961,7 @@ async fn main() {
                     BtnAction::ToggleTrails => { show_trails = !show_trails; flash.show(if show_trails { "TRAILS ON" } else { "TRAILS OFF" }); }
                     BtnAction::ToggleOrbits => { show_orbits = !show_orbits; flash.show(if show_orbits { "ORBITS ON" } else { "ORBITS OFF" }); }
                     BtnAction::ToggleGrid => { show_grid = !show_grid; flash.show(if show_grid { "GRID ON" } else { "GRID OFF" }); }
+                    BtnAction::ToggleCollisions => { realistic_collisions = !realistic_collisions; flash.show(if realistic_collisions { "COLLISIONS ON" } else { "COLLISIONS OFF" }); }
                     BtnAction::TogglePause => { paused = !paused; flash.show(if paused { "PAUSED" } else { "RUNNING" }); }
                     BtnAction::Recenter => { cam.recenter(); flash.show("CENTERED"); }
                     BtnAction::Clear => { bodies.clear(); flash.show("CLEARED"); }
@@ -979,7 +1000,7 @@ async fn main() {
             let mouse_world = cam.screen_to_world(mx as f64, my as f64, sw, sh);
             let dx = drag_start.0 - mouse_world.0;
             let dy = drag_start.1 - mouse_world.1;
-            place_body(&mut bodies, drag_start.0, drag_start.1, dx * 0.05, dy * 0.05, place_mode);
+            place_body(&mut bodies, drag_start.0, drag_start.1, dx * 0.017, dy * 0.017, place_mode);
         }
 
         // ---- PHYSICS ----
@@ -988,7 +1009,7 @@ async fn main() {
             let steps = (sim_dt / 1.5).ceil().max(1.0).min(8.0) as usize;
             let sub_dt = sim_dt / steps as f64;
             for _ in 0..steps {
-                step_physics(&mut bodies, sub_dt);
+                step_physics(&mut bodies, sub_dt, realistic_collisions);
             }
         }
 
